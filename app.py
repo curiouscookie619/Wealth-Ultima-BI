@@ -95,10 +95,19 @@ def run_projection(
         F_rate, admin_rate, K = r["F"], r["admin_rate"], r["K"]
         F_rate = min(max(F_rate, 0.0), 1.0)
 
-        F  = installment if (B <= ppt_years and C in scheduled) else 0.0
-        BS = F_rate * F * D
-        BU = F - BS
-        BV = (CK_prev + BU) * D
+        # Premium (at beginning of scheduled months, only while B <= PPT)
+F  = installment if (B <= ppt_years and C in scheduled) else 0.0
+
+# Allocation charge & GST on allocation
+BS = F_rate * F * D                   # Premium Allocation Charge
+BT = BS * SERVICE_TAX                 # GST on Premium Allocation Charge (18%)
+
+# Net premium allocated to fund
+BU = F - BS - BT
+
+# Fund at start
+BV = (CK_prev + BU) * D
+
 
         BW = ((admin_rate * annual_premium) / 12.0) * D
         BX = BW * SERVICE_TAX
@@ -143,7 +152,7 @@ def run_projection(
         CK_prev=CK
 
         results.append({
-            "Year":B,"Month":C,"F":round(F),"BS":round(BS),"BU":round(BU),"BV":round(BV),
+            "Year":B,"Month":C,"F":round(F),"BS":round(BS),"BT": round(BT),"BU":round(BU),"BV":round(BV),
             "BW":round(BW),"BX":round(BX),"BY":round(BY),"BZ":round(BZ),"CA":round(CA),
             "CB":round(CB),"CC":round(CC),"CD":round(CD),"CE":round(CE),"CF":round(CF),
             "CG":round(CG),"CH":round(CH),"CI":round(CI),"CJ":round(CJ),"CK":round(CK)
