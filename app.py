@@ -96,17 +96,17 @@ def run_projection(
         F_rate = min(max(F_rate, 0.0), 1.0)
 
         # Premium (at beginning of scheduled months, only while B <= PPT)
-F  = installment if (B <= ppt_years and C in scheduled) else 0.0
+        F  = installment if (B <= ppt_years and C in scheduled) else 0.0
 
 # Allocation charge & GST on allocation
-BS = F_rate * F * D                   # Premium Allocation Charge
-BT = BS * SERVICE_TAX                 # GST on Premium Allocation Charge (18%)
+        BS = F_rate * F * D                   # Premium Allocation Charge
+        BT = BS * SERVICE_TAX                 # GST on Premium Allocation Charge (18%)
 
 # Net premium allocated to fund
-BU = F - BS - BT
+        BU = F - BS - BT
 
 # Fund at start
-BV = (CK_prev + BU) * D
+        BV = (CK_prev + BU) * D
 
 
         BW = ((admin_rate * annual_premium) / 12.0) * D
