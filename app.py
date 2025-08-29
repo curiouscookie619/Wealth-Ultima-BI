@@ -14,9 +14,12 @@ DATA_DIR    = Path(__file__).parent / "data"
 SERVICE_TAX = 0.18       # GST (18%)
 COI_GST     = 0.18       # GST on COI (18%)
 COI_SCALER  = 1.0        # (no day-count proration)
+CE1_ANNUAL  = 0.08       # FIXED growth rate (8% p.a.)
+MR          = (1.0 + CE1_ANNUAL)**(1.0/12.0) - 1.0  # monthly rate
 
 @st.cache_data
 def load_rate_tables():
+    # Expected files in ./data
     charges = pd.read_csv(DATA_DIR / "rates_charges_by_year.csv")     # Year, AllocRate_F
     mort    = pd.read_csv(DATA_DIR / "mortality_grid.csv")            # Age, Male_perThousand, Female_perThousand
     funds   = pd.read_csv(DATA_DIR / "rates_fund_fmc.csv")            # Fund, FMC_annual (decimal)
@@ -28,9 +31,6 @@ CHARGES_DF, MORT_DF, FUNDS_DF, WINDOWS = load_rate_tables()
 # ===================
 # Helpers
 # ===================
-def monthly_rate_from_annual(annual):
-    return (1.0 + float(annual))**(1.0/12.0) - 1.0
-
 def attained_age(entry_age, policy_year):
     return entry_age + (policy_year - 1)
 
@@ -50,6 +50,7 @@ def charges_for_year(policy_year, entry_age, gender):
     return dict(F=F_rate, admin_rate=admin_rate, K=K)
 
 def sumproduct_fmc(allocation_dict):
+    # allocation_dict: {FundName: decimal_share}
     df = FUNDS_DF.copy()
     df["alloc"] = df["Fund"].map(lambda f: allocation_dict.get(f, 0.0))
     return float((df["alloc"] * df["FMC_annual"]).sum())
@@ -62,22 +63,19 @@ def modal_schedule(mode):
     return {"N":1, "months":[1]}
 
 def year_paid_this_year(rows, year, annual_premium):
-    # Sum of F for the year's months equals AP (±1 rupee)
-    paid = sum(r["F_raw"] for r in rows if r["Year"] == year)
+    # All due premiums for the year are paid if sum(F) == Annual Premium (±1 rupee)
+    paid = sum(r["F"] for r in rows if r["Year"] == year)
     return abs(paid - annual_premium) < 1.0
 
 # ===================
-# Core projection (monthly engine)
+# Core projection
 # ===================
 def run_projection(
     la_dob, la_gender,
     annual_premium, sum_assured,
     pt_years, ppt_years, mode,
-    allocation_dict,                 # {fund: decimal_share}, sum == 1.0
-    growth_annual                    # === NEW: pass 0.04 or 0.08 ===
+    allocation_dict # {fund: decimal_share}, sum == 1.0
 ):
-    MR = monthly_rate_from_annual(growth_annual)
-
     today = dt.date.today()
     la_age = today.year - la_dob.year - ((today.month, today.day) < (la_dob.month, la_dob.day))
 
@@ -137,7 +135,7 @@ def run_projection(
         # CD: Fund after COI
         CD = BY - CB - CC
 
-        # CE: Investment income at growth_annual (monthly MR)
+        # CE: Investment income at fixed 8% p.a. (monthly MR)
         CE = CD * MR * D
 
         # CF: FMC (monthly from annual) on (CD + CE) & CG: GST on FMC
@@ -184,78 +182,33 @@ def run_projection(
         CK = CH + CI + CJ
         CK_prev = CK
 
-        # store raw (float) + we will round on presentation
+        # Round everything to nearest integer for output
         results.append({
-            "Year": B, "Month": C,
-            "F_raw": F,
-            "BS_raw": BS, "BT_raw": BT, "BU_raw": BU,
-            "BV_raw": BV,
-            "BW_raw": BW, "BX_raw": BX,
-            "BY_raw": BY,
-            "BZ_raw": BZ, "CA_raw": CA,
-            "CB_raw": CB, "CC_raw": CC,
-            "CD_raw": CD, "CE_raw": CE,
-            "CF_raw": CF, "CG_raw": CG,
-            "CH_raw": CH,
-            "CI_raw": CI, "CJ_raw": CJ,
-            "CK_raw": CK,
+            "Year": int(B),
+            "Month": int(C),
+            "F": round(F),
+            "BS": round(BS), "BT": round(BT),
+            "BU": round(BU),
+            "BV": round(BV),
+            "BW": round(BW), "BX": round(BX),
+            "BY": round(BY),
+            "BZ": round(BZ), "CA": round(CA),
+            "CB": round(CB), "CC": round(CC),
+            "CD": round(CD), "CE": round(CE),
+            "CF": round(CF), "CG": round(CG),
+            "CH": round(CH),
+            "CI": round(CI), "CJ": round(CJ),
+            "CK": round(CK),
         })
 
     return pd.DataFrame(results)
 
-# === NEW: Yearly summary builder ============================================
-def make_yearly_summary(df_monthly, ppt_years):
-    """
-    Build the yearly table with these columns:
-    Policy Year | Annualised Premium | Mortality Charges | Other Charges | GST |
-    Fund value at End of Year | Surrender Value | Death Benefit
-    """
-    # sums within year
-    grp = df_monthly.groupby("Year", as_index=False).agg(
-        Annualised_Premium=("F_raw", "sum"),
-        Mortality_Charges=("CB_raw", "sum"),
-        Other_Charges=("BS_raw", "sum")  # start with allocation charge (excl GST)
-    )
-
-    # add Admin & FMC into 'Other Charges' (exclude any GSTs & exclude COI)
-    admin_sum = df_monthly.groupby("Year")["BW_raw"].sum().reset_index(name="BW_sum")
-    fmc_sum   = df_monthly.groupby("Year")["CF_raw"].sum().reset_index(name="CF_sum")
-    grp = grp.merge(admin_sum, on="Year", how="left").merge(fmc_sum, on="Year", how="left")
-    grp["Other_Charges"] = grp["Other_Charges"] + grp["BW_sum"].fillna(0.0) + grp["CF_sum"].fillna(0.0)
-    grp.drop(columns=["BW_sum","CF_sum"], inplace=True)
-
-    # total GST (BT + BX + CC + CG)
-    gst_sum = (
-        df_monthly.groupby("Year")[["BT_raw","BX_raw","CC_raw","CG_raw"]]
-        .sum()
-        .reset_index()
-    )
-    gst_sum["GST"] = gst_sum[["BT_raw","BX_raw","CC_raw","CG_raw"]].sum(axis=1)
-    grp = grp.merge(gst_sum[["Year","GST"]], on="Year", how="left")
-
-    # Fund value at end of year (CK of month 12), Death Benefit at end of year (BZ of month 12)
-    eoy = df_monthly[df_monthly["Month"] == 12].loc[:, ["Year","CK_raw","BZ_raw"]].rename(
-        columns={"CK_raw":"Fund_at_End_of_Year","BZ_raw":"Death_Benefit"}
-    )
-    grp = grp.merge(eoy, on="Year", how="left")
-
-    # Surrender Value: 0 till 5th year, else equal to Fund value at end of year
-    grp["Surrender_Value"] = np.where(grp["Year"] <= 5, 0.0, grp["Fund_at_End_of_Year"])
-
-    # Round to nearest rupee for presentation
-    for col in ["Annualised_Premium","Mortality_Charges","Other_Charges","GST","Fund_at_End_of_Year","Surrender_Value","Death_Benefit"]:
-        grp[col] = grp[col].round(0).astype(int)
-
-    # Ensure policy years are continuous even if projection stopped
-    grp = grp.sort_values("Year").reset_index(drop=True)
-    return grp
-# ============================================================================
 # ===================
 # UI
 # ===================
 st.set_page_config(page_title="Wealth Ultima — BI Calculator", layout="wide")
-st.title("Wealth Ultima — BI Calculator")
-st.caption("Dual-case summary at 4% and 8% per annum. FMC via fund allocation. All outputs rounded to nearest rupee.")
+st.title("Wealth Ultima — Standalone BI Calculator")
+st.caption("Growth fixed at 8% p.a. | FMC always via fund allocation | All outputs rounded to nearest rupee.")
 
 with st.sidebar:
     st.header("Policy Inputs")
@@ -264,7 +217,7 @@ with st.sidebar:
     la_gender = st.selectbox("Life Assured Gender", ["Female", "Male"], index=0)
 
     annual_premium = st.number_input("Annualised Premium (₹)", 0.0, 1e12, 250000.0, 1000.0, format="%.2f")
-    sum_assured    = st.number_input("Sum Assured (₹)",        0.0, 1e12, 4000000.0, 50000.0, format="%.2f")
+    sum_assured    = st.number_input("Sum Assured (₹)",        0.0, 1e12, 3250000.0, 50000.0, format="%.2f")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -295,60 +248,27 @@ with st.sidebar:
     st.progress(min(total_pct / 100.0, 1.0))
     st.write(f"**Total: {total_pct:.2f}%**")
 
-st.info("Death Benefit = max(Sum Assured, Fund Value after charges). FMC always via fund allocation.")
+    if abs(total_pct - 100.0) < 1e-6:
+        eff_fmc = sumproduct_fmc(alloc)
+        st.success(f"Effective FMC (annual): **{eff_fmc:.4f}**")
+    else:
+        st.warning("Allocation must total 100% to run the illustration.")
 
-run = st.button("Generate Yearly Summaries", type="primary")
+st.info("Death Benefit option is hidden (DB = max(Sum Assured, Fund Value)). Growth fixed at 8% p.a.")
+
+run = st.button("Run Illustration", type="primary")
 if run:
     if abs(total_pct - 100.0) >= 1e-6:
         st.error("Please ensure allocation totals 100% before running.")
     else:
-        # Run monthly engine twice: 4% and 8%
-        df_4 = run_projection(
+        df = run_projection(
             la_dob, la_gender,
             annual_premium, sum_assured,
             pt_years, ppt_years, mode,
-            alloc, growth_annual=0.04
+            alloc
         )
-        df_8 = run_projection(
-            la_dob, la_gender,
-            annual_premium, sum_assured,
-            pt_years, ppt_years, mode,
-            alloc, growth_annual=0.08
-        )
-
-        # Build yearly summaries
-        yr4 = make_yearly_summary(df_4, ppt_years)
-        yr8 = make_yearly_summary(df_8, ppt_years)
-
-        # Show side-by-side like your screenshot
-        c1, c2 = st.columns(2)
-        with c1:
-            st.subheader("At 4% p.a. Gross Investment Return")
-            st.dataframe(yr4.rename(columns={
-                "Year":"Policy Year",
-                "Annualised_Premium":"Annualised Premium",
-                "Mortality_Charges":"Mortality, Morbidity Charges",
-                "Other_Charges":"Other Charges*",
-                "GST":"GST",
-                "Fund_at_End_of_Year":"Fund at End of Year",
-                "Surrender_Value":"Surrender Value",
-                "Death_Benefit":"Death Benefit"
-            }), use_container_width=True)
-        with c2:
-            st.subheader("At 8% p.a. Gross Investment Return")
-            st.dataframe(yr8.rename(columns={
-                "Year":"Policy Year",
-                "Annualised_Premium":"Annualised Premium",
-                "Mortality_Charges":"Mortality, Morbidity Charges",
-                "Other_Charges":"Other Charges*",
-                "GST":"GST",
-                "Fund_at_End_of_Year":"Fund at End of Year",
-                "Surrender_Value":"Surrender Value",
-                "Death_Benefit":"Death Benefit"
-            }), use_container_width=True)
-
-        # Offer downloads
-        st.download_button("Download Yearly Summary (4%) CSV", yr4.to_csv(index=False), "yearly_summary_4pct.csv", "text/csv")
-        st.download_button("Download Yearly Summary (8%) CSV", yr8.to_csv(index=False), "yearly_summary_8pct.csv", "text/csv")
+        st.success("Done. Monthly table below.")
+        st.dataframe(df, use_container_width=True)
+        st.download_button("Download CSV", df.to_csv(index=False), "monthly_yieldcal.csv", "text/csv")
 else:
-    st.caption("Set inputs and click **Generate Yearly Summaries**.")
+    st.caption("Set inputs and click **Run Illustration**.")
