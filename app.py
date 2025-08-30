@@ -382,7 +382,7 @@ def format_summary(df):
 
         # Show side-by-side (like your screenshot)
     c1, c2 = st.columns(2)
-        with c1:
+    with c1:
             st.subheader("At 4% p.a. Gross Investment Return")
             st.dataframe(
     format_summary(yr4).rename(columns={
@@ -398,7 +398,7 @@ def format_summary(df):
     use_container_width=True
 )
 
-        with c2:
+    with c2:
             st.subheader("At 8% p.a. Gross Investment Return")
             st.dataframe(
     format_summary(yr4).rename(columns={
