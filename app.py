@@ -381,7 +381,7 @@ def format_summary(df):
     return df_fmt
 
         # Show side-by-side (like your screenshot)
-        c1, c2 = st.columns(2)
+             c1, c2 = st.columns(2)
         with c1:
             st.subheader("At 4% p.a. Gross Investment Return")
             st.dataframe(
