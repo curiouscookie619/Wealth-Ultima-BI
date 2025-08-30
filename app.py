@@ -344,6 +344,9 @@ with st.sidebar:
 
 st.info("Death Benefit = max(Sum Assured, Fund Value after charges). Discontinuance Fund is excluded from allocations.")
 
+# --- Bottom of app.py: action + output ---
+st.info("Death Benefit = max(Sum Assured, Fund Value after charges). Discontinuance Fund is excluded from allocations.")
+
 run = st.button("Generate Yearly Summaries", type="primary")
 if run:
     if abs(total_pct - 100.0) >= 1e-6:
@@ -366,56 +369,81 @@ if run:
         # Build yearly summaries
         yr4 = make_yearly_summary(df_4)
         yr8 = make_yearly_summary(df_8)
-def format_summary(df):
-    df_fmt = df.copy()
-    for col in [
-        "Annualised_Premium",
-        "Mortality_Charges",
-        "Other_Charges",
-        "GST",
-        "Fund_at_End_of_Year",
-        "Surrender_Value",
-        "Death_Benefit"
-    ]:
-        df_fmt[col] = df_fmt[col].apply(format_in_indian_system)
-    return df_fmt
 
-        # Show side-by-side (like your screenshot)
-    c1, c2 = st.columns(2)
-    with c1:
+        # Helper: Indian formatting for display
+        import re
+        def format_in_indian_system(num):
+            try:
+                num = int(num)
+            except Exception:
+                return num
+            s = str(num)
+            last3 = s[-3:]
+            rest = s[:-3]
+            if not rest:
+                return last3
+            rest = re.sub(r'(\d)(?=(\d{2})+$)', r'\1,', rest)
+            return rest + ',' + last3
+
+        def format_summary(df):
+            df_fmt = df.copy()
+            for col in [
+                "Annualised_Premium",
+                "Mortality_Charges",
+                "Other_Charges",
+                "GST",
+                "Fund_at_End_of_Year",
+                "Surrender_Value",
+                "Death_Benefit"
+            ]:
+                df_fmt[col] = df_fmt[col].apply(format_in_indian_system)
+            return df_fmt
+
+        # Display side-by-side with Indian formatting
+        c1, c2 = st.columns(2)
+        with c1:
             st.subheader("At 4% p.a. Gross Investment Return")
             st.dataframe(
-    format_summary(yr4).rename(columns={
-        "Year":"Policy Year",
-        "Annualised_Premium":"Annualised Premium",
-        "Mortality_Charges":"Mortality, Morbidity Charges",
-        "Other_Charges":"Other Charges*",
-        "GST":"GST",
-        "Fund_at_End_of_Year":"Fund at End of Year",
-        "Surrender_Value":"Surrender Value",
-        "Death_Benefit":"Death Benefit"
-    }),
-    use_container_width=True
-)
-
-    with c2:
+                format_summary(yr4).rename(columns={
+                    "Year":"Policy Year",
+                    "Annualised_Premium":"Annualised Premium",
+                    "Mortality_Charges":"Mortality, Morbidity Charges",
+                    "Other_Charges":"Other Charges*",
+                    "GST":"GST",
+                    "Fund_at_End_of_Year":"Fund at End of Year",
+                    "Surrender_Value":"Surrender Value",
+                    "Death_Benefit":"Death Benefit"
+                }),
+                use_container_width=True
+            )
+        with c2:
             st.subheader("At 8% p.a. Gross Investment Return")
             st.dataframe(
-    format_summary(yr4).rename(columns={
-        "Year":"Policy Year",
-        "Annualised_Premium":"Annualised Premium",
-        "Mortality_Charges":"Mortality, Morbidity Charges",
-        "Other_Charges":"Other Charges*",
-        "GST":"GST",
-        "Fund_at_End_of_Year":"Fund at End of Year",
-        "Surrender_Value":"Surrender Value",
-        "Death_Benefit":"Death Benefit"
-    }),
-    use_container_width=True
-)
+                format_summary(yr8).rename(columns={
+                    "Year":"Policy Year",
+                    "Annualised_Premium":"Annualised Premium",
+                    "Mortality_Charges":"Mortality, Morbidity Charges",
+                    "Other_Charges":"Other Charges*",
+                    "GST":"GST",
+                    "Fund_at_End_of_Year":"Fund at End of Year",
+                    "Surrender_Value":"Surrender Value",
+                    "Death_Benefit":"Death Benefit"
+                }),
+                use_container_width=True
+            )
 
-        # Downloads
-    st.download_button("Download Yearly Summary (4%) CSV", yr4.to_csv(index=False), "yearly_summary_4pct.csv", "text/csv")
-    st.download_button("Download Yearly Summary (8%) CSV", yr8.to_csv(index=False), "yearly_summary_8pct.csv", "text/csv")
+        # CSV downloads (keep raw integers for machine-readability)
+        st.download_button(
+            "Download Yearly Summary (4%) CSV",
+            yr4.to_csv(index=False),
+            "yearly_summary_4pct.csv",
+            "text/csv"
+        )
+        st.download_button(
+            "Download Yearly Summary (8%) CSV",
+            yr8.to_csv(index=False),
+            "yearly_summary_8pct.csv",
+            "text/csv"
+        )
 else:
     st.caption("Set inputs and click **Generate Yearly Summaries**.")
