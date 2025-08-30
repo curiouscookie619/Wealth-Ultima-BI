@@ -277,23 +277,35 @@ with st.sidebar:
     st.divider()
     st.subheader("Fund Allocation (must total 100%)")
 
-    # Friendlier allocation UI: default equal split + quick reset
-    default_split = round(100.0 / max(len(FUNDS_DF), 1), 2)
-    if st.button("Reset to equal split"):
-        for _, row in FUNDS_DF.iterrows():
-            st.session_state[row["Fund"]] = default_split
+    # Use only investable funds (remove Discontinuance Fund)
+FUNDS_INVESTABLE = filter_investable_funds(FUNDS_DF)
 
-    alloc = {}
-    total_pct = 0.0
-    for _, row in FUNDS_DF.iterrows():
-        key = row["Fund"]
-        default_val = st.session_state.get(key, default_split)
-        pct = st.number_input(f"{key} (%)", 0.0, 100.0, float(default_val), 0.5, key=key)
-        alloc[key] = pct / 100.0
-        total_pct += pct
+st.caption("Type % for each fund (e.g., 25 or 25%). Total must equal 100%.")
 
-    st.progress(min(total_pct / 100.0, 1.0))
-    st.write(f"**Total: {total_pct:.2f}%**")
+alloc = {}
+total_pct = 0.0
+
+# Open text fields (no +/- steppers)
+for _, row in FUNDS_INVESTABLE.iterrows():
+    key = f"alloc_{row['Fund']}"
+    # remember last typed value; default empty helps easy overwrite/paste
+    default_txt = st.session_state.get(key, "")
+    txt = st.text_input(row["Fund"], value=default_txt, key=key, placeholder="e.g., 25")
+    pct = parse_percent_input(txt)
+    alloc[row["Fund"]] = pct / 100.0
+    total_pct += pct
+
+# Progress + total
+st.progress(min(total_pct / 100.0, 1.0))
+st.write(f"**Total: {total_pct:.2f}%**")
+
+# Effective FMC only if total = 100%
+if abs(total_pct - 100.0) < 1e-6:
+    eff_fmc = sumproduct_fmc(alloc)
+    st.success(f"Effective FMC (annual): **{eff_fmc:.4f}**")
+else:
+    st.warning("Allocation must total 100% to run the illustration.")
+
 
 st.info("Death Benefit = max(Sum Assured, Fund Value after charges). FMC always via fund allocation.")
 
