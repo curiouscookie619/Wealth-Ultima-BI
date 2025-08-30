@@ -17,10 +17,15 @@ COI_SCALER  = 1.0        # (no day-count proration)
 
 @st.cache_data
 def load_rate_tables():
-    charges = pd.read_csv(DATA_DIR / "rates_charges_by_year.csv")     # Year, AllocRate_F
-    mort    = pd.read_csv(DATA_DIR / "mortality_grid.csv")            # Age, Male_perThousand, Female_perThousand
-    funds   = pd.read_csv(DATA_DIR / "rates_fund_fmc.csv")            # Fund, FMC_annual (decimal)
-    windows = json.loads((DATA_DIR / "windows.json").read_text())     # {"Q1_months": 12, "P1_months": 60}
+    # Expected files in ./data
+    # - rates_charges_by_year.csv: Year, AllocRate_F (decimal, e.g. 0.06)
+    # - mortality_grid.csv: Age, Male_perThousand, Female_perThousand
+    # - rates_fund_fmc.csv: Fund, FMC_annual (decimal, e.g. 0.0135)
+    # - windows.json: {"Q1_months": 12, "P1_months": 60}
+    charges = pd.read_csv(DATA_DIR / "rates_charges_by_year.csv")
+    mort    = pd.read_csv(DATA_DIR / "mortality_grid.csv")
+    funds   = pd.read_csv(DATA_DIR / "rates_fund_fmc.csv")
+    windows = json.loads((DATA_DIR / "windows.json").read_text())
     return charges, mort, funds, windows
 
 CHARGES_DF, MORT_DF, FUNDS_DF, WINDOWS = load_rate_tables()
@@ -38,7 +43,7 @@ def mortality_rate_per_thousand(age, gender):
     age = max(int(age), int(MORT_DF["Age"].min()))
     age = min(age,       int(MORT_DF["Age"].max()))
     row = MORT_DF.loc[MORT_DF["Age"] == age].iloc[0]
-    return float(row["Female_perThousand"] if gender.lower().startswith("f") else row["Male_perThousand"])
+    return float(row["Female_perThousand"] if str(gender).lower().startswith("f") else row["Male_perThousand"])
 
 def charges_for_year(policy_year, entry_age, gender):
     row = CHARGES_DF.loc[CHARGES_DF["Year"] == policy_year]
@@ -49,7 +54,27 @@ def charges_for_year(policy_year, entry_age, gender):
     K = mortality_rate_per_thousand(attained_age(entry_age, policy_year), gender)
     return dict(F=F_rate, admin_rate=admin_rate, K=K)
 
+def filter_investable_funds(df):
+    # Remove "Discontinuance Fund"
+    mask = ~df["Fund"].str.contains("discontinuance", case=False, na=False)
+    return df.loc[mask].reset_index(drop=True)
+
+def parse_percent_input(s: str) -> float:
+    """
+    Parse user-typed percent like '25', '25%', ' 25.5 '.
+    Returns a float percent in [0, 100]. Non-numeric => 0.
+    """
+    if s is None:
+        return 0.0
+    s = str(s).strip().replace("%", "")
+    try:
+        val = float(s)
+    except Exception:
+        return 0.0
+    return max(0.0, min(val, 100.0))
+
 def sumproduct_fmc(allocation_dict):
+    # allocation_dict: {FundName: decimal_share}
     df = FUNDS_DF.copy()
     df["alloc"] = df["Fund"].map(lambda f: allocation_dict.get(f, 0.0))
     return float((df["alloc"] * df["FMC_annual"]).sum())
@@ -62,7 +87,7 @@ def modal_schedule(mode):
     return {"N":1, "months":[1]}
 
 def year_paid_this_year(rows, year, annual_premium):
-    # Sum of F for the year's months equals AP (±1 rupee)
+    # All due premiums for the year are paid if sum(F) == Annual Premium (±1 rupee)
     paid = sum(r["F_raw"] for r in rows if r["Year"] == year)
     return abs(paid - annual_premium) < 1.0
 
@@ -74,10 +99,11 @@ def run_projection(
     annual_premium, sum_assured,
     pt_years, ppt_years, mode,
     allocation_dict,                 # {fund: decimal_share}, sum == 1.0
-    growth_annual                    # === NEW: pass 0.04 or 0.08 ===
+    growth_annual                    # 0.04 or 0.08
 ):
     MR = monthly_rate_from_annual(growth_annual)
 
+    # compute entry age from DOB at run time
     today = dt.date.today()
     la_age = today.year - la_dob.year - ((today.month, today.day) < (la_dob.month, la_dob.day))
 
@@ -184,7 +210,7 @@ def run_projection(
         CK = CH + CI + CJ
         CK_prev = CK
 
-        # store raw (float) + we will round on presentation
+        # store raw (float) values; rounding is applied in yearly summary presentation
         results.append({
             "Year": B, "Month": C,
             "F_raw": F,
@@ -203,10 +229,12 @@ def run_projection(
 
     return pd.DataFrame(results)
 
-# === NEW: Yearly summary builder ============================================
-def make_yearly_summary(df_monthly, ppt_years):
+# ===================
+# Yearly summary builder
+# ===================
+def make_yearly_summary(df_monthly):
     """
-    Build the yearly table with these columns:
+    Build the yearly table with columns:
     Policy Year | Annualised Premium | Mortality Charges | Other Charges | GST |
     Fund value at End of Year | Surrender Value | Death Benefit
     """
@@ -246,16 +274,15 @@ def make_yearly_summary(df_monthly, ppt_years):
     for col in ["Annualised_Premium","Mortality_Charges","Other_Charges","GST","Fund_at_End_of_Year","Surrender_Value","Death_Benefit"]:
         grp[col] = grp[col].round(0).astype(int)
 
-    # Ensure policy years are continuous even if projection stopped
     grp = grp.sort_values("Year").reset_index(drop=True)
     return grp
-# ============================================================================
+
 # ===================
 # UI
 # ===================
 st.set_page_config(page_title="Wealth Ultima — BI Calculator", layout="wide")
 st.title("Wealth Ultima — BI Calculator")
-st.caption("Dual-case summary at 4% and 8% per annum. FMC via fund allocation. All outputs rounded to nearest rupee.")
+st.caption("Dual-case yearly summaries at 4% and 8% p.a. | FMC via fund allocation | Type allocations freely (no steppers).")
 
 with st.sidebar:
     st.header("Policy Inputs")
@@ -276,38 +303,23 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Fund Allocation (must total 100%)")
+    FUNDS_INVESTABLE = filter_investable_funds(FUNDS_DF)
+    st.caption("Type % for each fund (e.g., 25 or 25%). Total must equal 100%.")
 
-    # Use only investable funds (remove Discontinuance Fund)
-FUNDS_INVESTABLE = filter_investable_funds(FUNDS_DF)
+    alloc = {}
+    total_pct = 0.0
+    for _, row in FUNDS_INVESTABLE.iterrows():
+        key = f"alloc_{row['Fund']}"
+        default_txt = st.session_state.get(key, "")
+        txt = st.text_input(row["Fund"], value=default_txt, key=key, placeholder="e.g., 25")
+        pct = parse_percent_input(txt)
+        alloc[row["Fund"]] = pct / 100.0
+        total_pct += pct
 
-st.caption("Type % for each fund (e.g., 25 or 25%). Total must equal 100%.")
+    st.progress(min(total_pct / 100.0, 1.0))
+    st.write(f"**Total: {total_pct:.2f}%**")
 
-alloc = {}
-total_pct = 0.0
-
-# Open text fields (no +/- steppers)
-for _, row in FUNDS_INVESTABLE.iterrows():
-    key = f"alloc_{row['Fund']}"
-    # remember last typed value; default empty helps easy overwrite/paste
-    default_txt = st.session_state.get(key, "")
-    txt = st.text_input(row["Fund"], value=default_txt, key=key, placeholder="e.g., 25")
-    pct = parse_percent_input(txt)
-    alloc[row["Fund"]] = pct / 100.0
-    total_pct += pct
-
-# Progress + total
-st.progress(min(total_pct / 100.0, 1.0))
-st.write(f"**Total: {total_pct:.2f}%**")
-
-# Effective FMC only if total = 100%
-if abs(total_pct - 100.0) < 1e-6:
-    eff_fmc = sumproduct_fmc(alloc)
-    st.success(f"Effective FMC (annual): **{eff_fmc:.4f}**")
-else:
-    st.warning("Allocation must total 100% to run the illustration.")
-
-
-st.info("Death Benefit = max(Sum Assured, Fund Value after charges). FMC always via fund allocation.")
+st.info("Death Benefit = max(Sum Assured, Fund Value after charges). Discontinuance Fund is excluded from allocations.")
 
 run = st.button("Generate Yearly Summaries", type="primary")
 if run:
@@ -329,10 +341,10 @@ if run:
         )
 
         # Build yearly summaries
-        yr4 = make_yearly_summary(df_4, ppt_years)
-        yr8 = make_yearly_summary(df_8, ppt_years)
+        yr4 = make_yearly_summary(df_4)
+        yr8 = make_yearly_summary(df_8)
 
-        # Show side-by-side like your screenshot
+        # Show side-by-side (like your screenshot)
         c1, c2 = st.columns(2)
         with c1:
             st.subheader("At 4% p.a. Gross Investment Return")
@@ -359,7 +371,7 @@ if run:
                 "Death_Benefit":"Death Benefit"
             }), use_container_width=True)
 
-        # Offer downloads
+        # Downloads
         st.download_button("Download Yearly Summary (4%) CSV", yr4.to_csv(index=False), "yearly_summary_4pct.csv", "text/csv")
         st.download_button("Download Yearly Summary (8%) CSV", yr8.to_csv(index=False), "yearly_summary_8pct.csv", "text/csv")
 else:
