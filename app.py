@@ -415,7 +415,7 @@ def format_summary(df):
 )
 
         # Downloads
-        st.download_button("Download Yearly Summary (4%) CSV", yr4.to_csv(index=False), "yearly_summary_4pct.csv", "text/csv")
-        st.download_button("Download Yearly Summary (8%) CSV", yr8.to_csv(index=False), "yearly_summary_8pct.csv", "text/csv")
+    st.download_button("Download Yearly Summary (4%) CSV", yr4.to_csv(index=False), "yearly_summary_4pct.csv", "text/csv")
+    st.download_button("Download Yearly Summary (8%) CSV", yr8.to_csv(index=False), "yearly_summary_8pct.csv", "text/csv")
 else:
     st.caption("Set inputs and click **Generate Yearly Summaries**.")
