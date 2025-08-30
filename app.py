@@ -6,6 +6,29 @@ import pandas as pd
 import streamlit as st
 from pathlib import Path
 import datetime as dt
+import re
+
+def format_in_indian_system(num):
+    """
+    Format an integer with Indian-style digit grouping:
+    1234567 -> '12,34,567'
+    123456  -> '1,23,456'
+    """
+    try:
+        num = int(num)
+    except Exception:
+        return num
+
+    s = str(num)
+    # First group (last 3 digits)
+    last3 = s[-3:]
+    rest = s[:-3]
+    if not rest:
+        return last3
+    # Add commas every 2 digits in the rest
+    rest = re.sub(r'(\d)(?=(\d{2})+$)', r'\1,', rest)
+    return rest + ',' + last3
+
 
 # ===================
 # Data & constants
@@ -343,33 +366,53 @@ if run:
         # Build yearly summaries
         yr4 = make_yearly_summary(df_4)
         yr8 = make_yearly_summary(df_8)
+def format_summary(df):
+    df_fmt = df.copy()
+    for col in [
+        "Annualised_Premium",
+        "Mortality_Charges",
+        "Other_Charges",
+        "GST",
+        "Fund_at_End_of_Year",
+        "Surrender_Value",
+        "Death_Benefit"
+    ]:
+        df_fmt[col] = df_fmt[col].apply(format_in_indian_system)
+    return df_fmt
 
         # Show side-by-side (like your screenshot)
         c1, c2 = st.columns(2)
         with c1:
             st.subheader("At 4% p.a. Gross Investment Return")
-            st.dataframe(yr4.rename(columns={
-                "Year":"Policy Year",
-                "Annualised_Premium":"Annualised Premium",
-                "Mortality_Charges":"Mortality, Morbidity Charges",
-                "Other_Charges":"Other Charges*",
-                "GST":"GST",
-                "Fund_at_End_of_Year":"Fund at End of Year",
-                "Surrender_Value":"Surrender Value",
-                "Death_Benefit":"Death Benefit"
-            }), use_container_width=True)
+            st.dataframe(
+    format_summary(yr4).rename(columns={
+        "Year":"Policy Year",
+        "Annualised_Premium":"Annualised Premium",
+        "Mortality_Charges":"Mortality, Morbidity Charges",
+        "Other_Charges":"Other Charges*",
+        "GST":"GST",
+        "Fund_at_End_of_Year":"Fund at End of Year",
+        "Surrender_Value":"Surrender Value",
+        "Death_Benefit":"Death Benefit"
+    }),
+    use_container_width=True
+)
+
         with c2:
             st.subheader("At 8% p.a. Gross Investment Return")
-            st.dataframe(yr8.rename(columns={
-                "Year":"Policy Year",
-                "Annualised_Premium":"Annualised Premium",
-                "Mortality_Charges":"Mortality, Morbidity Charges",
-                "Other_Charges":"Other Charges*",
-                "GST":"GST",
-                "Fund_at_End_of_Year":"Fund at End of Year",
-                "Surrender_Value":"Surrender Value",
-                "Death_Benefit":"Death Benefit"
-            }), use_container_width=True)
+            st.dataframe(
+    format_summary(yr4).rename(columns={
+        "Year":"Policy Year",
+        "Annualised_Premium":"Annualised Premium",
+        "Mortality_Charges":"Mortality, Morbidity Charges",
+        "Other_Charges":"Other Charges*",
+        "GST":"GST",
+        "Fund_at_End_of_Year":"Fund at End of Year",
+        "Surrender_Value":"Surrender Value",
+        "Death_Benefit":"Death Benefit"
+    }),
+    use_container_width=True
+)
 
         # Downloads
         st.download_button("Download Yearly Summary (4%) CSV", yr4.to_csv(index=False), "yearly_summary_4pct.csv", "text/csv")
