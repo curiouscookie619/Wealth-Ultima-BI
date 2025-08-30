@@ -342,7 +342,7 @@ with st.sidebar:
     st.progress(min(total_pct / 100.0, 1.0))
     st.write(f"**Total: {total_pct:.2f}%**")
 
-st.info("Death Benefit = max(Sum Assured, Fund Value after charges). Discontinuance Fund is excluded from allocations.")
+# st.info("Death Benefit = max(Sum Assured, Fund Value after charges). Discontinuance Fund is excluded from allocations.")
 
 # --- Bottom of app.py: action + output ---
 st.info("Death Benefit = max(Sum Assured, Fund Value after charges). Discontinuance Fund is excluded from allocations.")
