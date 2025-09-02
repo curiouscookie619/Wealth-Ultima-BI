@@ -8,28 +8,6 @@ from pathlib import Path
 import datetime as dt
 import re
 
-def format_in_indian_system(num):
-    """
-    Format an integer with Indian-style digit grouping:
-    1234567 -> '12,34,567'
-    123456  -> '1,23,456'
-    """
-    try:
-        num = int(num)
-    except Exception:
-        return num
-
-    s = str(num)
-    # First group (last 3 digits)
-    last3 = s[-3:]
-    rest = s[:-3]
-    if not rest:
-        return last3
-    # Add commas every 2 digits in the rest
-    rest = re.sub(r'(\d)(?=(\d{2})+$)', r'\1,', rest)
-    return rest + ',' + last3
-
-
 # ===================
 # Data & constants
 # ===================
@@ -114,6 +92,23 @@ def year_paid_this_year(rows, year, annual_premium):
     paid = sum(r["F_raw"] for r in rows if r["Year"] == year)
     return abs(paid - annual_premium) < 1.0
 
+def format_in_indian_system(num):
+    """
+    Format an integer with Indian-style digit grouping:
+    1234567 -> '12,34,567'
+    """
+    try:
+        num = int(num)
+    except Exception:
+        return num
+    s = str(num)
+    last3 = s[-3:]
+    rest = s[:-3]
+    if not rest:
+        return last3
+    rest = re.sub(r'(\d)(?=(\d{2})+$)', r'\1,', rest)
+    return rest + ',' + last3
+
 # ===================
 # Core projection (monthly engine)
 # ===================
@@ -173,7 +168,7 @@ def run_projection(
         # Fund Value after CHRG (pre-COI) — anchor
         BY = BV - BW - BX
 
-        # BZ: Death Benefit = higher of (Sum Assured, BY) within term
+        # BZ (monthly DB) is not used in yearly summary now; keep simple if needed:
         BZ = max(sum_assured, BY) if D == 1 else 0.0
 
         # CA: Sum at Risk
@@ -233,7 +228,7 @@ def run_projection(
         CK = CH + CI + CJ
         CK_prev = CK
 
-        # store raw (float) values; rounding is applied in yearly summary presentation
+        # store raw (float) values; rounding/formatting is applied in yearly summary presentation
         results.append({
             "Year": B, "Month": C,
             "F_raw": F,
@@ -255,11 +250,12 @@ def run_projection(
 # ===================
 # Yearly summary builder
 # ===================
-def make_yearly_summary(df_monthly):
+def make_yearly_summary(df_monthly, sum_assured):
     """
     Build the yearly table with columns:
     Policy Year | Annualised Premium | Mortality Charges | Other Charges | GST |
     Fund value at End of Year | Surrender Value | Death Benefit
+    Death Benefit (per year) = max(Sum Assured, Fund at End of Year)
     """
     # sums within year
     grp = df_monthly.groupby("Year", as_index=False).agg(
@@ -284,21 +280,38 @@ def make_yearly_summary(df_monthly):
     gst_sum["GST"] = gst_sum[["BT_raw","BX_raw","CC_raw","CG_raw"]].sum(axis=1)
     grp = grp.merge(gst_sum[["Year","GST"]], on="Year", how="left")
 
-    # Fund value at end of year (CK of month 12), Death Benefit at end of year (BZ of month 12)
-    eoy = df_monthly[df_monthly["Month"] == 12].loc[:, ["Year","CK_raw","BZ_raw"]].rename(
-        columns={"CK_raw":"Fund_at_End_of_Year","BZ_raw":"Death_Benefit"}
+    # Fund value at end of year (CK of month 12)
+    eoy = df_monthly[df_monthly["Month"] == 12].loc[:, ["Year","CK_raw"]].rename(
+        columns={"CK_raw":"Fund_at_End_of_Year"}
     )
     grp = grp.merge(eoy, on="Year", how="left")
+
+    # --- Death Benefit change: DB = max(SA, Fund_at_End_of_Year) ---
+    grp["Death_Benefit"] = np.maximum(sum_assured, grp["Fund_at_End_of_Year"].fillna(0.0))
 
     # Surrender Value: 0 till 5th year, else equal to Fund value at end of year
     grp["Surrender_Value"] = np.where(grp["Year"] <= 5, 0.0, grp["Fund_at_End_of_Year"])
 
-    # Round to nearest rupee for presentation
+    # Round to nearest rupee for presentation, then apply Indian formatting on display (not here)
     for col in ["Annualised_Premium","Mortality_Charges","Other_Charges","GST","Fund_at_End_of_Year","Surrender_Value","Death_Benefit"]:
         grp[col] = grp[col].round(0).astype(int)
 
     grp = grp.sort_values("Year").reset_index(drop=True)
     return grp
+
+def format_summary_indian(df):
+    df_fmt = df.copy()
+    for col in [
+        "Annualised_Premium",
+        "Mortality_Charges",
+        "Other_Charges",
+        "GST",
+        "Fund_at_End_of_Year",
+        "Surrender_Value",
+        "Death_Benefit"
+    ]:
+        df_fmt[col] = df_fmt[col].apply(format_in_indian_system)
+    return df_fmt
 
 # ===================
 # UI
@@ -342,10 +355,7 @@ with st.sidebar:
     st.progress(min(total_pct / 100.0, 1.0))
     st.write(f"**Total: {total_pct:.2f}%**")
 
-# st.info("Death Benefit = max(Sum Assured, Fund Value after charges). Discontinuance Fund is excluded from allocations.")
-
-# --- Bottom of app.py: action + output ---
-st.info("Death Benefit = max(Sum Assured, Fund Value after charges). Discontinuance Fund is excluded from allocations.")
+st.info("Death Benefit (yearly) = max(Sum Assured, Fund Value at end of that year). Discontinuance Fund is excluded from allocations.")
 
 run = st.button("Generate Yearly Summaries", type="primary")
 if run:
@@ -366,45 +376,16 @@ if run:
             alloc, growth_annual=0.08
         )
 
-        # Build yearly summaries
-        yr4 = make_yearly_summary(df_4)
-        yr8 = make_yearly_summary(df_8)
-
-        # Helper: Indian formatting for display
-        import re
-        def format_in_indian_system(num):
-            try:
-                num = int(num)
-            except Exception:
-                return num
-            s = str(num)
-            last3 = s[-3:]
-            rest = s[:-3]
-            if not rest:
-                return last3
-            rest = re.sub(r'(\d)(?=(\d{2})+$)', r'\1,', rest)
-            return rest + ',' + last3
-
-        def format_summary(df):
-            df_fmt = df.copy()
-            for col in [
-                "Annualised_Premium",
-                "Mortality_Charges",
-                "Other_Charges",
-                "GST",
-                "Fund_at_End_of_Year",
-                "Surrender_Value",
-                "Death_Benefit"
-            ]:
-                df_fmt[col] = df_fmt[col].apply(format_in_indian_system)
-            return df_fmt
+        # Build yearly summaries (pass sum_assured so DB = max(SA, FV_end))
+        yr4 = make_yearly_summary(df_4, sum_assured=sum_assured)
+        yr8 = make_yearly_summary(df_8, sum_assured=sum_assured)
 
         # Display side-by-side with Indian formatting
         c1, c2 = st.columns(2)
         with c1:
             st.subheader("At 4% p.a. Gross Investment Return")
             st.dataframe(
-                format_summary(yr4).rename(columns={
+                format_summary_indian(yr4).rename(columns={
                     "Year":"Policy Year",
                     "Annualised_Premium":"Annualised Premium",
                     "Mortality_Charges":"Mortality, Morbidity Charges",
@@ -419,7 +400,7 @@ if run:
         with c2:
             st.subheader("At 8% p.a. Gross Investment Return")
             st.dataframe(
-                format_summary(yr8).rename(columns={
+                format_summary_indian(yr8).rename(columns={
                     "Year":"Policy Year",
                     "Annualised_Premium":"Annualised Premium",
                     "Mortality_Charges":"Mortality, Morbidity Charges",
