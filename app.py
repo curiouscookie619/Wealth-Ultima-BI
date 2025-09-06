@@ -1,6 +1,8 @@
-# app_inforce_pdf.py
-# Streamlit Cloud–ready: parses POS PDF with pdfplumber (text PDFs),
-# asks only PTD + FV Today, then generates In-Force outputs per your spec.
+# app.py — Streamlit Cloud–ready In-Force Illustration
+# - Upload POS PDF -> auto-read Issue Date, PT/PPT, Mode, Premium, SA, Allocations
+# - User inputs only PTD + Current FV
+# - Projections: 8% continue, 5% DF (within lock-in if discontinued)
+# - Outputs per your spec
 
 import io, re, math, json
 import numpy as np
@@ -9,29 +11,24 @@ import streamlit as st
 from pathlib import Path
 import datetime as dt
 
-# ---- Optional date helper (robust human dates)
+# robust human date parsing
 from dateutil import parser as dparser
-
-# ---- PDF text extraction
+# PDF text extraction
 import pdfplumber
 
 # ===================
 # Data & constants
 # ===================
 DATA_DIR    = Path(__file__).parent / "data"
-SERVICE_TAX = 0.18       # GST (18%)
-COI_GST     = 0.18       # GST on COI (18%)
+SERVICE_TAX = 0.18
+COI_GST     = 0.18
 COI_SCALER  = 1.0
-DF_ANNUAL   = 0.05       # Discontinuance Fund growth (p.a.) within lock-in
-CONT_ANNUAL = 0.08       # Continue path growth (p.a.)
+DF_ANNUAL   = 0.05   # discontinuance fund growth (lock-in)
+CONT_ANNUAL = 0.08   # continue growth
 
 @st.cache_data
 def load_rate_tables():
-    # In ./data:
-    # - rates_charges_by_year.csv: Year, AllocRate_F
-    # - mortality_grid.csv: Age, Male_perThousand, Female_perThousand
-    # - rates_fund_fmc.csv: Fund, FMC_annual
-    # - windows.json: {"Q1_months":12,"P1_months":60}
+    # Put these 4 files in ./data
     charges = pd.read_csv(DATA_DIR / "rates_charges_by_year.csv")
     mort    = pd.read_csv(DATA_DIR / "mortality_grid.csv")
     funds   = pd.read_csv(DATA_DIR / "rates_fund_fmc.csv")
@@ -85,7 +82,7 @@ def format_in_indian_system(num):
     rest = _re.sub(r'(\d)(?=(\d{2})+$)', r'\1,', rest)
     return rest + ',' + last3
 
-# ---- Dates & status
+# Dates / status
 def add_years(d: dt.date, years: int) -> dt.date:
     try:
         return d.replace(year=d.year + years)
@@ -123,7 +120,7 @@ def determine_policy_status(issue_date: dt.date, ptd_date: dt.date, valuation_da
     return "RPU", lk_end, ppt_end, False
 
 # ===================
-# POS PDF parser (text PDFs via pdfplumber)
+# POS PDF parser (pdfplumber)
 # ===================
 DATE_PATTERNS = [
     r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b",
@@ -153,7 +150,6 @@ def _parse_human_date(s: str) -> dt.date | None:
     try:
         return dparser.parse(s, dayfirst=True, fuzzy=True).date()
     except Exception:
-        # try common manual formats
         for fmt in ("%d-%m-%Y","%d/%m/%Y","%d-%b-%Y","%d %b %Y","%d %B %Y","%d/%m/%y","%d-%m-%y"):
             try:
                 return dt.datetime.strptime(s, fmt).date()
@@ -197,28 +193,22 @@ def parse_pos_pdf(file_bytes: bytes):
         full = "\n".join(all_text)
         out["raw_text"] = full
 
-        # Issue date
         out["issue_date"] = issue_date_found or _first_match(DATE_PATTERNS, full)
 
-        # PT / PPT
         m_pt = re.search(r"(Policy\s*Term|PT)\s*[:\-]?\s*(\d{1,3})\s*(years|yrs)?", full, re.I)
         if m_pt: out["pt_years"] = int(m_pt.group(2))
         m_ppt = re.search(r"(Premium\s*Payment\s*Term|PPT)\s*[:\-]?\s*(\d{1,3})\s*(years|yrs)?", full, re.I)
         if m_ppt: out["ppt_years"] = int(m_ppt.group(2))
 
-        # Mode
         m_mode = re.search(r"(Premium\s*Mode|Mode)\s*[:\-]?\s*(Annual|Semi-Annual|Quarterly|Monthly)", full, re.I)
         if m_mode: out["mode"] = m_mode.group(2).title()
 
-        # Annual Premium
         m_ap = re.search(r"(Annual(?:ised)?\s*Premium)[^₹\d]*" + CURRENCY, full, re.I)
         if m_ap: out["annual_premium"] = _to_number(m_ap.group(1))
 
-        # Sum Assured
         m_sa = re.search(r"(Sum\s*Assured)[^₹\d]*" + CURRENCY, full, re.I)
         if m_sa: out["sum_assured"] = _to_number(m_sa.group(1))
 
-        # Fund allocations (simple “Fund … 25%” lines)
         allocations = []
         for line in full.splitlines():
             m = re.search(r"([A-Za-z][A-Za-z0-9 \-&]+?)\s+"+PCT+r"$", line.strip())
@@ -268,7 +258,6 @@ def run_projection_inforce(
         C = ((m-1)%12)+1                   # Month 1..12
         D = 1 if B <= pt_years else 0
 
-        # Growth regime
         annual_r = DF_ANNUAL if (status == "DISCONTINUED" and B <= 5) else CONT_ANNUAL
         MR = monthly_rate_from_annual(annual_r)
 
@@ -276,47 +265,47 @@ def run_projection_inforce(
         F_rate, admin_rate, K = r["F"], r["admin_rate"], r["K"]
         F_rate = min(max(F_rate, 0.0), 1.0)
 
-        # Premiums only in Premium-Paying
+        # premiums only in Premium-Paying
         F = installment if (status == "PREMIUM_PAYING" and B <= ppt_years and C in scheduled) else 0.0
 
-        # Allocation & GST
+        # allocation & GST
         BS = F_rate * F * D
         BT = BS * SERVICE_TAX
         BU = F - BS - BT
 
-        # Fund at start
+        # fund at start
         BV = (CK_prev + BU) * D
 
-        # Admin & GST
+        # admin & GST
         BW = ((admin_rate * annual_premium) / 12.0) * D
         BX = BW * SERVICE_TAX
 
-        # Pre-COI
+        # pre-COI
         BY = BV - BW - BX
 
-        # DB anchor for SAR math (not displayed)
+        # DB anchor (not displayed)
         BZ = max(sum_assured, BY) if D == 1 else 0.0
         CA = max(BZ - BY, 0.0)
 
-        # Mortality & GST
+        # mortality & GST
         CB = CA * (K / 12000.0) * COI_SCALER * D
         CC = CB * COI_GST
 
-        # Post-COI
+        # post-COI
         CD = BY - CB - CC
 
-        # Growth
+        # growth
         CE = CD * MR * D
 
         # FMC + GST
         CF = (CD + CE) * (fmc_effective / 12.0)
         CG = CF * SERVICE_TAX
 
-        # Pre-additions
+        # pre-additions
         CH = CD + CE - CF - CG
         CH_hist.append(CH)
 
-        # Additions:
+        # additions
         CI = 0.0
         CJ = 0.0
         if D == 1 and C == 12:
@@ -331,9 +320,9 @@ def run_projection_inforce(
             else:
                 BA = 0.0
 
-            if determine_policy_status(issue_date, ptd_date, valuation_date, ppt_years)[0] == "DISCONTINUED":
+            if status == "DISCONTINUED":
                 CI, CJ = 0.0, 0.0
-            elif determine_policy_status(issue_date, ptd_date, valuation_date, ppt_years)[0] in ("RPU","FULLY_PAID_UP"):
+            elif status in ("RPU","FULLY_PAID_UP"):
                 CI, CJ = GA + BA, 0.0
             else:  # PREMIUM_PAYING
                 CI = GA + BA
@@ -470,10 +459,8 @@ else:
     eq = 1.0 / max(1, len(inv))
     alloc_from_pdf = [(f, 100.0*eq) for f in inv["Fund"].tolist()]
 
-# Optional overrides
-# Optional overrides
+# ----------- Optional overrides (FIXED: no with...else) -----------
 override = st.checkbox("Override parsed values (optional)", value=False)
-
 if override:
     with st.expander("Override parsed values (optional)", expanded=True):
         issue_date = st.date_input("Issue Date (override)", value=issue_date)
@@ -482,7 +469,7 @@ if override:
         mode       = st.selectbox(
             "Premium Mode",
             ["Annual","Semi-Annual","Quarterly","Monthly"],
-            index=["Annual","Semi-Annual","Quarterly","Monthly"].index(mode)
+            index=["Annual","Semi-Annual","Quarterly","Monthly"].index(mode),
         )
         annual_premium = st.number_input("Annualised Premium (₹)", 0.0, 1e12, annual_premium, 1000.0)
         sum_assured    = st.number_input("Sum Assured (₹)",       0.0, 1e12, sum_assured,    50000.0)
@@ -496,11 +483,10 @@ if override:
             total += v
         st.write(f"Total: {total:.2f}%")
 else:
-    # Build alloc_dict from parsed (read-only)
     alloc_dict = {fund: pct/100.0 for fund, pct in alloc_from_pdf}
+# ----------- end overrides -----------
 
-
-# LA (kept in an expander; override if the POS PDF doesn’t have it)
+# LA details
 with st.expander("Life Assured details (only if needed)"):
     la_dob    = st.date_input("Life Assured DOB", value=dt.date(1990,1,1))
     la_gender = st.selectbox("Life Assured Gender", ["Female","Male"], index=0)
@@ -567,7 +553,11 @@ if run:
     yr_fmt = yr_tbl.copy()
     yr_fmt["FV_EOY"] = yr_fmt["FV_EOY"].apply(lambda x: format_in_indian_system(x) if pd.notnull(x) else "—")
     st.dataframe(
-        yr_fmt.rename(columns={"Year":"Policy Year","FV_EOY":"Fund Value at Year End","Charges_pct_of_FV":"Charges as % of FV"}),
+        yr_fmt.rename(columns={
+            "Year":"Policy Year",
+            "FV_EOY":"Fund Value at Year End",
+            "Charges_pct_of_FV":"Charges as % of FV"
+        }),
         use_container_width=True
     )
 
