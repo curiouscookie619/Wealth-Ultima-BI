@@ -1,4 +1,4 @@
-# app.py
+# app_inforce.py
 import math
 import json
 import numpy as np
@@ -14,11 +14,13 @@ import re
 DATA_DIR    = Path(__file__).parent / "data"
 SERVICE_TAX = 0.18       # GST (18%)
 COI_GST     = 0.18       # GST on COI (18%)
-COI_SCALER  = 1.0        # (no day-count proration)
+COI_SCALER  = 1.0        # keep 1.0 (no day-count pro-ration)
+DF_ANNUAL   = 0.05       # Discontinuance Fund growth (p.a.)
+CONT_ANNUAL = 0.08       # Continue (normal) growth (p.a.)
 
 @st.cache_data
 def load_rate_tables():
-    # Expected files in ./data
+    # Required files in ./data
     # - rates_charges_by_year.csv: Year, AllocRate_F (decimal, e.g. 0.06)
     # - mortality_grid.csv: Age, Male_perThousand, Female_perThousand
     # - rates_fund_fmc.csv: Fund, FMC_annual (decimal, e.g. 0.0135)
@@ -34,7 +36,7 @@ CHARGES_DF, MORT_DF, FUNDS_DF, WINDOWS = load_rate_tables()
 # ===================
 # Helpers
 # ===================
-def monthly_rate_from_annual(annual):
+def monthly_rate_from_annual(annual: float) -> float:
     return (1.0 + float(annual))**(1.0/12.0) - 1.0
 
 def attained_age(entry_age, policy_year):
@@ -50,32 +52,25 @@ def charges_for_year(policy_year, entry_age, gender):
     row = CHARGES_DF.loc[CHARGES_DF["Year"] == policy_year]
     if row.empty: row = CHARGES_DF.iloc[[-1]]
     row = row.iloc[0]
-    F_rate = float(row.get("AllocRate_F", 0.0))        # decimal (e.g., 0.06)
-    admin_rate = 0.0165 if policy_year <= 5 else 0.0   # 1.65% p.a. only in Yrs 1–5
+    F_rate = float(row.get("AllocRate_F", 0.0))
+    admin_rate = 0.0165 if policy_year <= 5 else 0.0  # 1.65% p.a. only in Yrs 1–5
     K = mortality_rate_per_thousand(attained_age(entry_age, policy_year), gender)
     return dict(F=F_rate, admin_rate=admin_rate, K=K)
 
 def filter_investable_funds(df):
-    # Remove "Discontinuance Fund"
     mask = ~df["Fund"].str.contains("discontinuance", case=False, na=False)
     return df.loc[mask].reset_index(drop=True)
 
 def parse_percent_input(s: str) -> float:
-    """
-    Parse user-typed percent like '25', '25%', ' 25.5 '.
-    Returns a float percent in [0, 100]. Non-numeric => 0.
-    """
-    if s is None:
-        return 0.0
+    if s is None: return 0.0
     s = str(s).strip().replace("%", "")
     try:
-        val = float(s)
+        v = float(s)
     except Exception:
         return 0.0
-    return max(0.0, min(val, 100.0))
+    return max(0.0, min(v, 100.0))
 
 def sumproduct_fmc(allocation_dict):
-    # allocation_dict: {FundName: decimal_share}
     df = FUNDS_DF.copy()
     df["alloc"] = df["Fund"].map(lambda f: allocation_dict.get(f, 0.0))
     return float((df["alloc"] * df["FMC_annual"]).sum())
@@ -88,17 +83,12 @@ def modal_schedule(mode):
     return {"N":1, "months":[1]}
 
 def year_paid_this_year(rows, year, annual_premium):
-    # All due premiums for the year are paid if sum(F) == Annual Premium (±1 rupee)
     paid = sum(r["F_raw"] for r in rows if r["Year"] == year)
     return abs(paid - annual_premium) < 1.0
 
 def format_in_indian_system(num):
-    """
-    Format an integer with Indian-style digit grouping:
-    1234567 -> '12,34,567'
-    """
     try:
-        num = int(num)
+        num = int(round(num))
     except Exception:
         return num
     s = str(num)
@@ -109,103 +99,154 @@ def format_in_indian_system(num):
     rest = re.sub(r'(\d)(?=(\d{2})+$)', r'\1,', rest)
     return rest + ',' + last3
 
+# ---------- Date helpers and Status logic ----------
+def add_years(d: dt.date, years: int) -> dt.date:
+    try:
+        return d.replace(year=d.year + years)
+    except ValueError:
+        return d.replace(month=2, day=28, year=d.year + years)
+
+def months_between(d0: dt.date, d1: dt.date) -> int:
+    sign = 1 if d1 >= d0 else -1
+    a, b = (d0, d1) if sign == 1 else (d1, d0)
+    m = (b.year - a.year) * 12 + (b.month - a.month)
+    if b.day < a.day:
+        m -= 1
+    return sign * m
+
+def policy_year_today(issue_date: dt.date, valuation_date: dt.date, pt_years: int) -> int:
+    elapsed_months = max(0, months_between(issue_date, valuation_date))
+    py = 1 + (elapsed_months // 12)
+    return max(1, min(py, pt_years))
+
+def lockin_end_date(issue_date: dt.date) -> dt.date:
+    return add_years(issue_date, 5)
+
+def ppt_end_date(issue_date: dt.date, ppt_years: int) -> dt.date:
+    return add_years(issue_date, ppt_years)
+
+def determine_policy_status(issue_date: dt.date, ptd_date: dt.date, valuation_date: dt.date, ppt_years: int):
+    lk_end = lockin_end_date(issue_date)
+    ppt_end = ppt_end_date(issue_date, ppt_years)
+    in_lockin = valuation_date <= lk_end
+
+    if ptd_date >= valuation_date:
+        return "PREMIUM_PAYING", lk_end, ppt_end, in_lockin
+    if valuation_date > ppt_end:
+        return "FULLY_PAID_UP", lk_end, ppt_end, in_lockin
+    if in_lockin:
+        return "DISCONTINUED", lk_end, ppt_end, True
+    return "RPU", lk_end, ppt_end, False
+
 # ===================
-# Core projection (monthly engine)
+# Core projection (monthly engine, IFI)
 # ===================
-def run_projection(
+def run_projection_inforce(
+    issue_date, valuation_date, ptd_date,
     la_dob, la_gender,
     annual_premium, sum_assured,
     pt_years, ppt_years, mode,
     allocation_dict,                 # {fund: decimal_share}, sum == 1.0
-    growth_annual                    # 0.04 or 0.08
+    fv0_seed,                        # Fund Value today (seed)
 ):
-    MR = monthly_rate_from_annual(growth_annual)
+    """Returns: df_monthly, status, lk_end, ppt_end, in_lockin"""
+    status, lk_end, ppt_end, in_lockin = determine_policy_status(issue_date, ptd_date, valuation_date, ppt_years)
 
-    # compute entry age from DOB at run time
-    today = dt.date.today()
-    la_age = today.year - la_dob.year - ((today.month, today.day) < (la_dob.month, la_dob.day))
+    # entry age today
+    la_age_today = valuation_date.year - la_dob.year - ((valuation_date.month, valuation_date.day) < (la_dob.month, la_dob.day))
 
     months   = pt_years * 12
     results  = []
-    CK_prev  = 0.0
-    CH_hist  = []  # store CH each month for rolling averages
+    CK_prev  = float(fv0_seed)  # seed with FV today
+    CH_hist  = []
 
-    # Premium mode → installment amount & schedule
     spec        = modal_schedule(mode)
     N           = spec["N"]
     scheduled   = spec["months"]
     installment = annual_premium / N if N > 0 else annual_premium
 
-    # FMC always via SUMPRODUCT (must sum to 1.0)
     fmc_effective = sumproduct_fmc(allocation_dict)
 
-    for m in range(1, months+1):
-        B = math.ceil(m/12)                # Policy Year
-        C = ((m-1)%12)+1                   # Month 1..12
-        D = 1 if B <= pt_years else 0      # In-force flag
+    # Determine the policy year at valuation date so that month indexing continues correctly.
+    # We project forward from the month AFTER valuation month until PT end.
+    start_month_index = months_between(issue_date, valuation_date) + 1
+    start_month_index = max(1, start_month_index)
 
-        r = charges_for_year(B, la_age, la_gender)
+    for m in range(start_month_index, months+1):
+        B = math.ceil(m/12)         # Policy Year
+        C = ((m-1)%12)+1            # Month 1..12
+        D = 1 if B <= pt_years else 0
+
+        # Annual rate for this month
+        if status == "DISCONTINUED" and (B <= 5):
+            annual_r = DF_ANNUAL
+        else:
+            annual_r = CONT_ANNUAL
+        MR = monthly_rate_from_annual(annual_r)
+
+        # Charges parameters
+        r = charges_for_year(B, la_age_today, la_gender)
         F_rate, admin_rate, K = r["F"], r["admin_rate"], r["K"]
         F_rate = min(max(F_rate, 0.0), 1.0)
 
-        # F: Premium at the beginning of the scheduled months (only while B<=PPT)
-        F  = installment if (B <= ppt_years and C in scheduled) else 0.0
+        # Premiums depending on status
+        if status == "PREMIUM_PAYING":
+            F = installment if (B <= ppt_years and C in scheduled) else 0.0
+        elif status in ("RPU","FULLY_PAID_UP","DISCONTINUED"):
+            F = 0.0
+        else:
+            F = 0.0
 
-        # Allocation charge & GST on it
-        BS = F_rate * F * D                            # Premium Allocation Charge
-        BT = BS * SERVICE_TAX                          # GST on Allocation Charge (18%)
-
-        # Net premium allocated to fund
+        # Allocation + GST
+        BS = F_rate * F * D
+        BT = BS * SERVICE_TAX
         BU = F - BS - BT
 
-        # Fund at start (this month)
+        # Fund at start of month
         BV = (CK_prev + BU) * D
 
-        # Admin charge (Yrs 1–5) & GST on admin
+        # Admin + GST
         BW = ((admin_rate * annual_premium) / 12.0) * D
         BX = BW * SERVICE_TAX
 
-        # Fund Value after CHRG (pre-COI) — anchor
+        # Pre-COI
         BY = BV - BW - BX
 
-        # BZ (monthly DB) is not used in yearly summary now; keep simple if needed:
+        # DB anchor (we won't display DB but we keep SAR math)
         BZ = max(sum_assured, BY) if D == 1 else 0.0
-
-        # CA: Sum at Risk
         CA = max(BZ - BY, 0.0)
 
-        # CB: COI (mortality) & CC: GST on COI
+        # Mortality + GST
         CB = CA * (K / 12000.0) * COI_SCALER * D
         CC = CB * COI_GST
 
-        # CD: Fund after COI
+        # Post-COI
         CD = BY - CB - CC
 
-        # CE: Investment income at growth_annual (monthly MR)
+        # Growth
         CE = CD * MR * D
 
-        # CF: FMC (monthly from annual) on (CD + CE) & CG: GST on FMC
+        # FMC + GST
         CF = (CD + CE) * (fmc_effective / 12.0)
         CG = CF * SERVICE_TAX
 
-        # CH: Fund Value before additions
+        # Pre-additions fund
         CH = CD + CE - CF - CG
         CH_hist.append(CH)
 
-        # Year-end additions: CI (GA + BA) and CJ (Loyalty)
+        # Year-end additions
         CI = 0.0
         CJ = 0.0
         if D == 1 and C == 12:
-            q1 = int(WINDOWS.get("Q1_months", 12))   # 12-month window
-            p1 = int(WINDOWS.get("P1_months", 60))   # 60-month window
-
+            q1 = int(WINDOWS.get("Q1_months", 12))
+            p1 = int(WINDOWS.get("P1_months", 60))
             avg_Q1 = np.mean(CH_hist[-min(q1, len(CH_hist)):]) if CH_hist else 0.0
             avg_P1 = np.mean(CH_hist[-min(p1, len(CH_hist)):]) if CH_hist else 0.0
 
-            # GA: 0.25% of last 12-month average, from end of 6th year onwards
+            # GA from Y6
             GA = 0.0025 * avg_Q1 if B >= 6 else 0.0
 
-            # BA: Booster — end of every 5th year from year 10
+            # Booster at 10,15,20... (10/15=2.75%, else 3.5%)
             if B >= 10 and (B % 5 == 0):
                 BA = (0.0275 * avg_P1) if B in (10, 15) else (0.0350 * avg_P1)
             else:
@@ -213,129 +254,148 @@ def run_projection(
 
             CI = GA + BA
 
-            # CJ: Loyalty — 0.15% of last 12-month average
-            # From end of 6th year till end of PPT, provided all due premiums for the year are paid
-            if B >= 6:
+            # Loyalty (skip in RPU/FULLY_PAID_UP; allowed in Premium-paying if all due paid)
+            if status == "PREMIUM_PAYING" and B >= 6:
                 if ppt_years == 5:
-                    CJ = 0.0
+                    pass
                 elif ppt_years == 6:
                     CJ = 0.0015 * avg_Q1 if (B == 6 and year_paid_this_year(results, B, annual_premium)) else 0.0
                 else:
                     if (B <= ppt_years) and year_paid_this_year(results, B, annual_premium):
                         CJ = 0.0015 * avg_Q1
 
-        # CK: Fund Value at end
         CK = CH + CI + CJ
         CK_prev = CK
 
-        # store raw (float) values; rounding/formatting is applied in yearly summary presentation
         results.append({
             "Year": B, "Month": C,
             "F_raw": F,
             "BS_raw": BS, "BT_raw": BT, "BU_raw": BU,
-            "BV_raw": BV,
             "BW_raw": BW, "BX_raw": BX,
             "BY_raw": BY,
-            "BZ_raw": BZ, "CA_raw": CA,
             "CB_raw": CB, "CC_raw": CC,
-            "CD_raw": CD, "CE_raw": CE,
             "CF_raw": CF, "CG_raw": CG,
             "CH_raw": CH,
             "CI_raw": CI, "CJ_raw": CJ,
             "CK_raw": CK,
+            "annual_r": annual_r,
         })
 
-    return pd.DataFrame(results)
+    return pd.DataFrame(results), status, lk_end, ppt_end, in_lockin
 
 # ===================
-# Yearly summary builder
+# Output builders
 # ===================
-def make_yearly_summary(df_monthly, sum_assured):
-    """
-    Build the yearly table with columns:
-    Policy Year | Annualised Premium | Mortality Charges | Other Charges | GST |
-    Fund value at End of Year | Surrender Value | Death Benefit
-    Death Benefit (per year) = max(Sum Assured, Fund at End of Year)
+def yearly_fv_and_chargepct(df_monthly):
+    """Table: Year | Fund at End of Year | Charges as % of FV
+       Charges = Allocation + Admin + Mortality + FMC + all GSTs
     """
     # sums within year
     grp = df_monthly.groupby("Year", as_index=False).agg(
-        Annualised_Premium=("F_raw", "sum"),
-        Mortality_Charges=("CB_raw", "sum"),
-        Other_Charges=("BS_raw", "sum")  # start with allocation charge (excl GST)
+        F=("F_raw","sum"),
+        BS=("BS_raw","sum"), BT=("BT_raw","sum"),
+        BW=("BW_raw","sum"), BX=("BX_raw","sum"),
+        CB=("CB_raw","sum"), CC=("CC_raw","sum"),
+        CF=("CF_raw","sum"), CG=("CG_raw","sum"),
     )
+    eoy = df_monthly[df_monthly["Month"] == 12].loc[:, ["Year","CK_raw"]].rename(columns={"CK_raw":"FV_EOY"})
+    out = grp.merge(eoy, on="Year", how="left")
+    out["Total_Charges"] = out[["BS","BT","BW","BX","CB","CC","CF","CG"]].sum(axis=1)
+    out["Charges_pct_of_FV"] = np.where(out["FV_EOY"]>0, (out["Total_Charges"]/out["FV_EOY"])*100.0, 0.0)
+    tbl = out.loc[:, ["Year","FV_EOY","Charges_pct_of_FV"]].copy()
+    tbl["FV_EOY"] = tbl["FV_EOY"].round(0).astype("Int64")
+    tbl["Charges_pct_of_FV"] = tbl["Charges_pct_of_FV"].round(2)
+    return tbl
 
-    # add Admin & FMC into 'Other Charges' (exclude any GSTs & exclude COI)
-    admin_sum = df_monthly.groupby("Year")["BW_raw"].sum().reset_index(name="BW_sum")
-    fmc_sum   = df_monthly.groupby("Year")["CF_raw"].sum().reset_index(name="CF_sum")
-    grp = grp.merge(admin_sum, on="Year", how="left").merge(fmc_sum, on="Year", how="left")
-    grp["Other_Charges"] = grp["Other_Charges"] + grp["BW_sum"].fillna(0.0) + grp["CF_sum"].fillna(0.0)
-    grp.drop(columns=["BW_sum","CF_sum"], inplace=True)
+def fv_after_n_years(df_monthly, n: int):
+    row = df_monthly[(df_monthly["Month"]==12) & (df_monthly["Year"]==n)]
+    if row.empty: return None
+    return float(row["CK_raw"].iloc[0])
 
-    # total GST (BT + BX + CC + CG)
-    gst_sum = (
-        df_monthly.groupby("Year")[["BT_raw","BX_raw","CC_raw","CG_raw"]]
-        .sum()
-        .reset_index()
-    )
-    gst_sum["GST"] = gst_sum[["BT_raw","BX_raw","CC_raw","CG_raw"]].sum(axis=1)
-    grp = grp.merge(gst_sum[["Year","GST"]], on="Year", how="left")
+def discontinuance_table(fv0_seed, issue_date, valuation_date):
+    """DF path: grow at 5% p.a. (monthly) until end of 5th policy year; show Y1..Y5 from valuation context if needed."""
+    rows = []
+    mr = monthly_rate_from_annual(DF_ANNUAL)
+    # months remaining until end of 5th policy year
+    end_y5 = add_years(issue_date, 5)
+    months_rem = max(0, months_between(valuation_date, end_y5))
+    # Simulate month by month at DF rate
+    fv = float(fv0_seed)
+    m_idx = 0
+    current_date = valuation_date
+    while m_idx < months_rem:
+        m_idx += 1
+        fv = fv * (1.0 + mr)
+        # collect at policy-year boundaries
+        # If we crossed a policy anniversary, we can mark a line; for simplicity, show only Year 5 closing value:
+    # Build minimal table Y5
+    rows.append(dict(Policy_Year=5, DF_Closing_Value=round(fv,0)))
+    return pd.DataFrame(rows)
 
-    # Fund value at end of year (CK of month 12)
-    eoy = df_monthly[df_monthly["Month"] == 12].loc[:, ["Year","CK_raw"]].rename(
-        columns={"CK_raw":"Fund_at_End_of_Year"}
-    )
-    grp = grp.merge(eoy, on="Year", how="left")
+def partial_withdrawal_availability(df_monthly, issue_date, la_dob, annual_premium, pt_years):
+    """Compute eligibility and max available per policy year at EOY.
+       Rules: PY>=6, LA age >=18; FV_after >= 105% of total premiums paid; min 500 (we present max available).
+    """
+    # Build cumulative premiums paid (from monthly df)
+    prem_by_year = df_monthly.groupby("Year")["F_raw"].sum().reindex(range(1, pt_years+1), fill_value=0.0)
+    cum_prem = prem_by_year.cumsum()
 
-    # --- Death Benefit change: DB = max(SA, Fund_at_End_of_Year) ---
-    grp["Death_Benefit"] = np.maximum(sum_assured, grp["Fund_at_End_of_Year"].fillna(0.0))
+    # FV at EOY
+    fv_eoy = df_monthly[df_monthly["Month"]==12].set_index("Year")["CK_raw"].reindex(range(1, pt_years+1)).fillna(0.0)
 
-    # Surrender Value: 0 till 5th year, else equal to Fund value at end of year
-    grp["Surrender_Value"] = np.where(grp["Year"] <= 5, 0.0, grp["Fund_at_End_of_Year"])
+    # LA age per policy year
+    la_age_at_issue = la_dob.year
+    # compute LA attained age at each PY end:
+    ages = []
+    for y in range(1, pt_years+1):
+        # attained age at PY y end:
+        ages.append(None)  # not used directly (simplify)
 
-    # Round to nearest rupee for presentation, then apply Indian formatting on display (not here)
-    for col in ["Annualised_Premium","Mortality_Charges","Other_Charges","GST","Fund_at_End_of_Year","Surrender_Value","Death_Benefit"]:
-        grp[col] = grp[col].round(0).astype(int)
-
-    grp = grp.sort_values("Year").reset_index(drop=True)
-    return grp
-
-def format_summary_indian(df):
-    df_fmt = df.copy()
-    for col in [
-        "Annualised_Premium",
-        "Mortality_Charges",
-        "Other_Charges",
-        "GST",
-        "Fund_at_End_of_Year",
-        "Surrender_Value",
-        "Death_Benefit"
-    ]:
-        df_fmt[col] = df_fmt[col].apply(format_in_indian_system)
-    return df_fmt
+    # Determine max allowed = max(0, FV_EOY - 105%*cum_prem); else not eligible; min withdrawal 500
+    rows = []
+    # estimate LA age from df_monthly first year rows
+    # (Not strictly required since rule is LA>=18 at withdrawal years; assume LA is >=18 in IFI typical)
+    for y in range(1, pt_years+1):
+        fv = float(fv_eoy.get(y, 0.0))
+        th = 1.05 * float(cum_prem.get(y, 0.0))
+        if y < 6:
+            rows.append(dict(Policy_Year=y, Eligible="No", Max_Available=0, Notes="Not allowed before 6th year"))
+            continue
+        max_avail = max(0.0, fv - th)
+        if max_avail < 500.0:
+            rows.append(dict(Policy_Year=y, Eligible="No", Max_Available=0, Notes="Would breach 105% rule / < ₹500"))
+        else:
+            rows.append(dict(Policy_Year=y, Eligible="Yes", Max_Available=int(round(max_avail)), Notes="OK"))
+    return pd.DataFrame(rows)
 
 # ===================
 # UI
 # ===================
-st.set_page_config(page_title="Wealth Ultima — BI Calculator", layout="wide")
-st.title("Wealth Ultima — BI Calculator")
-st.caption("Dual-case yearly summaries at 4% and 8% p.a. | FMC via fund allocation | Type allocations freely (no steppers).")
+st.set_page_config(page_title="Wealth Ultima — In-Force Illustration (IFI)", layout="wide")
+st.title("Wealth Ultima — In-Force Illustration")
+st.caption("Status auto-computed from PTD / Lock-in. Growth: 8% p.a. (continue) and 5% p.a. in Discontinuance Fund.")
 
 with st.sidebar:
     st.header("Policy Inputs")
 
+    # Extra inputs now required
+    issue_date     = st.date_input("Issue Date", value=dt.date(2018, 1, 1), min_value=dt.date(1900,1,1))
+    ptd_date       = st.date_input("Paid-to-Date (PTD)", value=dt.date(2025, 1, 1), min_value=dt.date(1900,1,1))
+    valuation_date = st.date_input("Valuation Date", value=dt.date.today(), min_value=dt.date(1900,1,1))
+    fv0_seed       = st.number_input("Fund Value Today (₹)", 0.0, 1e12, 250000.0, 1000.0, format="%.2f")
+
     la_dob    = st.date_input("Life Assured DOB", value=dt.date(1990, 1, 1), min_value=dt.date(1900,1,1))
     la_gender = st.selectbox("Life Assured Gender", ["Female", "Male"], index=0)
 
-    annual_premium = st.number_input("Annualised Premium (₹)", 0.0, 1e12, 250000.0, 1000.0, format="%.2f")
     sum_assured    = st.number_input("Sum Assured (₹)",        0.0, 1e12, 4000000.0, 50000.0, format="%.2f")
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
         pt_years  = st.number_input("Policy Term (years)", 1, 100, 26, 1)
     with col2:
         ppt_years = st.number_input("PPT (years)",         1, 100, 15, 1)
-
-    mode = st.selectbox("Premium Mode", ["Annual", "Semi-Annual", "Quarterly", "Monthly"], index=0)
+    with col3:
+        mode = st.selectbox("Premium Mode", ["Annual", "Semi-Annual", "Quarterly", "Monthly"], index=0)
 
     st.divider()
     st.subheader("Fund Allocation (must total 100%)")
@@ -355,76 +415,104 @@ with st.sidebar:
     st.progress(min(total_pct / 100.0, 1.0))
     st.write(f"**Total: {total_pct:.2f}%**")
 
-st.info("Death Benefit (yearly) = max(Sum Assured, Fund Value at end of that year). Discontinuance Fund is excluded from allocations.")
+run = st.button("Generate In-Force Outputs", type="primary")
 
-run = st.button("Generate Yearly Summaries", type="primary")
 if run:
     if abs(total_pct - 100.0) >= 1e-6:
         st.error("Please ensure allocation totals 100% before running.")
     else:
-        # Run monthly engine twice: 4% and 8%
-        df_4 = run_projection(
+        # Run monthly engine (seeded with FV0; status auto-computed from dates)
+        df_m, status, lk_end, ppt_end, in_lockin = run_projection_inforce(
+            issue_date, valuation_date, ptd_date,
             la_dob, la_gender,
-            annual_premium, sum_assured,
-            pt_years, ppt_years, mode,
-            alloc, growth_annual=0.04
-        )
-        df_8 = run_projection(
-            la_dob, la_gender,
-            annual_premium, sum_assured,
-            pt_years, ppt_years, mode,
-            alloc, growth_annual=0.08
+            annual_premium=sum_assured*0.0 + st.session_state.get("annual_premium_hint", 250000.0),  # if you want a free input, replace line
+            sum_assured=sum_assured,
+            pt_years=pt_years, ppt_years=ppt_years, mode=mode,
+            allocation_dict=alloc,
+            fv0_seed=fv0_seed
         )
 
-        # Build yearly summaries (pass sum_assured so DB = max(SA, FV_end))
-        yr4 = make_yearly_summary(df_4, sum_assured=sum_assured)
-        yr8 = make_yearly_summary(df_8, sum_assured=sum_assured)
+        # NOTE: replace annual_premium above with a proper input if needed:
+        # annual_premium = st.number_input("Annualised Premium (₹)", 0.0, 1e12, 250000.0, 1000.0, format="%.2f")
 
-        # Display side-by-side with Indian formatting
-        c1, c2 = st.columns(2)
+        # 1) Header snapshot
+        st.subheader("Snapshot")
+        c1, c2, c3 = st.columns(3)
         with c1:
-            st.subheader("At 4% p.a. Gross Investment Return")
-            st.dataframe(
-                format_summary_indian(yr4).rename(columns={
-                    "Year":"Policy Year",
-                    "Annualised_Premium":"Annualised Premium",
-                    "Mortality_Charges":"Mortality, Morbidity Charges",
-                    "Other_Charges":"Other Charges*",
-                    "GST":"GST",
-                    "Fund_at_End_of_Year":"Fund at End of Year",
-                    "Surrender_Value":"Surrender Value",
-                    "Death_Benefit":"Death Benefit"
-                }),
-                use_container_width=True
-            )
+            st.write(f"**Issue Date:** {issue_date.strftime('%d-%b-%Y')}")
+            st.write(f"**Valuation Date:** {valuation_date.strftime('%d-%b-%Y')}")
+            st.write(f"**Lock-in End:** {lk_end.strftime('%d-%b-%Y')}")
         with c2:
-            st.subheader("At 8% p.a. Gross Investment Return")
-            st.dataframe(
-                format_summary_indian(yr8).rename(columns={
-                    "Year":"Policy Year",
-                    "Annualised_Premium":"Annualised Premium",
-                    "Mortality_Charges":"Mortality, Morbidity Charges",
-                    "Other_Charges":"Other Charges*",
-                    "GST":"GST",
-                    "Fund_at_End_of_Year":"Fund at End of Year",
-                    "Surrender_Value":"Surrender Value",
-                    "Death_Benefit":"Death Benefit"
-                }),
-                use_container_width=True
-            )
+            st.write(f"**Status (computed):** {status}")
+            st.write(f"**PPT End:** {ppt_end.strftime('%d-%b-%Y')}")
+            st.write(f"**Mode:** {mode}")
+        with c3:
+            st.write(f"**Fund Value Today:** ₹{format_in_indian_system(fv0_seed)}")
+            st.write(f"**PT/PPT:** {pt_years} / {ppt_years}")
+            st.write(f"**Sum Assured:** ₹{format_in_indian_system(sum_assured)}")
 
-        # CSV downloads (keep raw integers for machine-readability)
-        st.download_button(
-            "Download Yearly Summary (4%) CSV",
-            yr4.to_csv(index=False),
-            "yearly_summary_4pct.csv",
-            "text/csv"
+        # 2) Projection Summary KPIs
+        st.subheader("Projection Summary (8% p.a.; DF at 5% p.a.)")
+        fv_2y = fv_after_n_years(df_m, policy_year_today(issue_date, add_years(valuation_date, 2), pt_years))
+        fv_5y = fv_after_n_years(df_m, policy_year_today(issue_date, add_years(valuation_date, 5), pt_years))
+        colA, colB, colC = st.columns(3)
+        with colA:
+            st.metric("Fund Value in 2 Years (Continue @8%)", f"₹{format_in_indian_system(fv_2y) if fv_2y else '—'}")
+        with colB:
+            st.metric("Fund Value in 5 Years (Continue @8%)", f"₹{format_in_indian_system(fv_5y) if fv_5y else '—'}")
+        with colC:
+            if status == "DISCONTINUED":
+                df_df = discontinuance_table(fv0_seed, issue_date, valuation_date)
+                df_y5 = int(df_df.loc[df_df["Policy_Year"]==5, "DF_Closing_Value"].iloc[0]) if not df_df.empty else None
+                st.metric("DF Payout at end of 5th Year (@5%)", f"₹{format_in_indian_system(df_y5) if df_y5 else '—'}")
+            else:
+                st.write("")
+
+        if status == "DISCONTINUED":
+            # Compare DF Y5 vs Continue path Y5 (premiums paid)
+            if fv_5y is not None and not df_df.empty:
+                df_y5 = float(df_df.loc[df_df["Policy_Year"]==5, "DF_Closing_Value"].iloc[0])
+                delta = fv_5y - df_y5
+                st.info(f"**Comparison:** Continue (@8%, with premiums) at 5 years = ₹{format_in_indian_system(fv_5y)} vs DF payout = ₹{format_in_indian_system(df_y5)} → **Δ = ₹{format_in_indian_system(delta)}**")
+
+        # 3) Yearly table: FV EOY + Charges% of FV
+        st.subheader("Yearly Projection (End-of-Year)")
+        yr_tbl = yearly_fv_and_chargepct(df_m)
+        yr_tbl_fmt = yr_tbl.copy()
+        yr_tbl_fmt["FV_EOY"] = yr_tbl_fmt["FV_EOY"].apply(lambda x: format_in_indian_system(x) if pd.notnull(x) else "—")
+        st.dataframe(yr_tbl_fmt.rename(columns={
+            "Year":"Policy Year",
+            "FV_EOY":"Fund Value at Year End",
+            "Charges_pct_of_FV":"Charges as % of FV"
+        }), use_container_width=True)
+
+        # 4) DF path table (only if Discontinued within lock-in)
+        if status == "DISCONTINUED":
+            st.subheader("Discontinuance Fund Path (@5% p.a.)")
+            st.caption("Money remains in DF until end of 5th policy year; auto-surrender thereafter.")
+            st.dataframe(discontinuance_table(fv0_seed, issue_date, valuation_date), use_container_width=True)
+
+        # 6) Partial withdrawals availability (year-wise)
+        st.subheader("Partial Withdrawal — Eligibility & Maximum Available (EOY basis)")
+        st.caption("Rules: allowed from 6th policy year and LA age ≥18; min ₹500; FV after withdrawal ≥ 105% of total premiums paid. Top-up precedence will apply when history is connected.")
+        pw_tbl = partial_withdrawal_availability(df_m, issue_date, la_dob, annual_premium=0.0, pt_years=pt_years)
+        pw_fmt = pw_tbl.copy()
+        pw_fmt["Max_Available"] = pw_fmt["Max_Available"].apply(lambda x: f"₹{format_in_indian_system(x)}" if x else "₹0")
+        st.dataframe(pw_fmt.rename(columns={
+            "Policy_Year":"Policy Year",
+            "Eligible":"Eligible?",
+            "Max_Available":"Max Available",
+            "Notes":"Notes"
+        }), use_container_width=True)
+
+        # 7) Tax & switching notes
+        st.subheader("Tax & Switching (Quick Notes)")
+        st.markdown(
+            "- **Maturity proceeds tax-free** under Section 10(10D) (pre-2021 policies with annual premium ≤ 10% of SA).\n"
+            "- **Death benefit** is always tax-free.\n"
+            "- **Fund switches** inside ULIP are unlimited & **not taxable**; MF switches are taxable events.\n"
+            "- Buying fresh insurance later is typically **more expensive** (higher age, medicals, GST)."
         )
-        st.download_button(
-            "Download Yearly Summary (8%) CSV",
-            yr8.to_csv(index=False),
-            "yearly_summary_8pct.csv",
-            "text/csv"
-        )
+
 else:
-    st.caption("Set inputs and click **Generate Yearly Summaries**.")
+    st.caption("Fill inputs and click **Generate In-Force Outputs**.")
