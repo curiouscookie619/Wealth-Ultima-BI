@@ -1,36 +1,19 @@
 # app_inforce_pdf.py
-# Streamlit app that: (1) reads POS PDF, (2) falls back to OCR if needed,
-# (3) asks only PTD + FV Today, (4) generates in-force outputs.
-import io, re, math, json, os
+# Streamlit Cloud–ready: parses POS PDF with pdfplumber (text PDFs),
+# asks only PTD + FV Today, then generates In-Force outputs per your spec.
+
+import io, re, math, json
 import numpy as np
 import pandas as pd
 import streamlit as st
 from pathlib import Path
 import datetime as dt
 
-# ---------- Optional imports for parsing ----------
-HAVE_DATEUTIL = False
-try:
-    from dateutil import parser as dparser
-    HAVE_DATEUTIL = True
-except Exception:
-    pass
+# ---- Optional date helper (robust human dates)
+from dateutil import parser as dparser
 
-HAVE_PDFPLUMBER = False
-try:
-    import pdfplumber
-    HAVE_PDFPLUMBER = True
-except Exception:
-    pass
-
-HAVE_OCR = False
-try:
-    import pytesseract
-    from pdf2image import convert_from_bytes
-    from PIL import Image
-    HAVE_OCR = True
-except Exception:
-    pass
+# ---- PDF text extraction
+import pdfplumber
 
 # ===================
 # Data & constants
@@ -39,12 +22,12 @@ DATA_DIR    = Path(__file__).parent / "data"
 SERVICE_TAX = 0.18       # GST (18%)
 COI_GST     = 0.18       # GST on COI (18%)
 COI_SCALER  = 1.0
-DF_ANNUAL   = 0.05       # Discontinuance Fund growth (p.a.) in lock-in
-CONT_ANNUAL = 0.08       # Continue growth (p.a.)
+DF_ANNUAL   = 0.05       # Discontinuance Fund growth (p.a.) within lock-in
+CONT_ANNUAL = 0.08       # Continue path growth (p.a.)
 
 @st.cache_data
 def load_rate_tables():
-    # in ./data:
+    # In ./data:
     # - rates_charges_by_year.csv: Year, AllocRate_F
     # - mortality_grid.csv: Age, Male_perThousand, Female_perThousand
     # - rates_fund_fmc.csv: Fund, FMC_annual
@@ -58,7 +41,7 @@ def load_rate_tables():
 CHARGES_DF, MORT_DF, FUNDS_DF, WINDOWS = load_rate_tables()
 
 # ===================
-# Generic helpers
+# Helpers
 # ===================
 def monthly_rate_from_annual(annual: float) -> float:
     return (1.0 + float(annual))**(1.0/12.0) - 1.0
@@ -79,7 +62,7 @@ def charges_for_year(policy_year, la_age_today, gender):
     return dict(F=F_rate, admin_rate=admin_rate, K=K)
 
 def filter_investable_funds(df):
-    return df.loc[~df["Fund"].str.contains("discontinuance", case=False, na=False)].reset_index(drop_index=True)
+    return df.loc[~df["Fund"].str.contains("discontinuance", case=False, na=False)].reset_index(drop=True)
 
 def sumproduct_fmc(allocation_dict):
     df = FUNDS_DF.copy()
@@ -102,7 +85,7 @@ def format_in_indian_system(num):
     rest = _re.sub(r'(\d)(?=(\d{2})+$)', r'\1,', rest)
     return rest + ',' + last3
 
-# ---------- Date helpers & Status logic ----------
+# ---- Dates & status
 def add_years(d: dt.date, years: int) -> dt.date:
     try:
         return d.replace(year=d.year + years)
@@ -140,12 +123,12 @@ def determine_policy_status(issue_date: dt.date, ptd_date: dt.date, valuation_da
     return "RPU", lk_end, ppt_end, False
 
 # ===================
-# POS PDF parser (with OCR fallback)
+# POS PDF parser (text PDFs via pdfplumber)
 # ===================
 DATE_PATTERNS = [
-    r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b",           # 31/01/2020 or 31-01-2020
-    r"\b(\d{1,2}\s*[A-Za-z]{3,9}\s*\d{2,4})\b",       # 31 Jan 2020
-    r"\b(\d{1,2}-[A-Za-z]{3}-\d{2,4})\b",             # 31-Jan-2020
+    r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b",
+    r"\b(\d{1,2}\s*[A-Za-z]{3,9}\s*\d{2,4})\b",
+    r"\b(\d{1,2}-[A-Za-z]{3}-\d{2,4})\b",
 ]
 CURRENCY = r"₹?\s?([\d,]+(?:\.\d{1,2})?)"
 PCT = r"(\d{1,3}(?:\.\d+)?)[ ]*%"
@@ -167,29 +150,22 @@ def _to_number(s: str):
 
 def _parse_human_date(s: str) -> dt.date | None:
     if not s: return None
-    if HAVE_DATEUTIL:
-        try:
-            return dparser.parse(s, dayfirst=True, fuzzy=True).date()
-        except Exception:
-            pass
-    # simple fallbacks for common formats
-    for p in DATE_PATTERNS:
-        m = re.search(p, s)
-        if m:
-            token = m.group(1)
-            for fmt in ("%d-%m-%Y","%d/%m/%Y","%d-%b-%Y","%d %b %Y","%d %B %Y","%d/%m/%y","%d-%m-%y"):
-                try:
-                    return dt.datetime.strptime(token, fmt).date()
-                except:
-                    continue
+    try:
+        return dparser.parse(s, dayfirst=True, fuzzy=True).date()
+    except Exception:
+        # try common manual formats
+        for fmt in ("%d-%m-%Y","%d/%m/%Y","%d-%b-%Y","%d %b %Y","%d %B %Y","%d/%m/%y","%d-%m-%y"):
+            try:
+                return dt.datetime.strptime(s, fmt).date()
+            except:
+                continue
     return None
 
-def _extract_issue_date_anchor_pdfplumber(page) -> str | None:
+def _extract_issue_date_anchor(page) -> str | None:
     try:
         words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
     except Exception:
         return None
-    candidates = []
     for w in words or []:
         if w['text'].strip().lower() == 'date':
             y0, y1 = w['top'], w['bottom']
@@ -203,125 +179,60 @@ def _extract_issue_date_anchor_pdfplumber(page) -> str | None:
                 val = right_words[0]['text'].strip().rstrip(",.;")
                 hit = _first_match(DATE_PATTERNS, val)
                 if hit: return hit
-                candidates.append(val)
     return None
 
-def _ocr_whole_pdf(file_bytes: bytes) -> str:
-    """OCR every page to text (fallback when no text layer)."""
-    if not HAVE_OCR:
-        return ""
-    try:
-        images = convert_from_bytes(file_bytes, fmt="png", dpi=300)
-        texts = []
-        for img in images:
-            texts.append(pytesseract.image_to_string(img))
-        return "\n".join(texts)
-    except Exception:
-        return ""
-
-def _ocr_issue_date_by_patch(file_bytes: bytes) -> str | None:
-    """Try to OCR only a header band to find 'Date' then pick the right token."""
-    if not HAVE_OCR:
-        return None
-    try:
-        images = convert_from_bytes(file_bytes, fmt="png", dpi=300, first_page=1, last_page=1)
-        if not images: return None
-        img = images[0]
-        w, h = img.size
-        # crop a top band where "Date / Place" usually sits (top 25%)
-        band = img.crop((0, 0, w, int(0.25*h)))
-        txt = pytesseract.image_to_string(band)
-        # simple anchor: find 'Date' and read next token-like date
-        # fallback: return first date pattern in the band
-        hit = _first_match(DATE_PATTERNS, txt)
-        return hit
-    except Exception:
-        return None
-
 def parse_pos_pdf(file_bytes: bytes):
-    """
-    Returns:
-      {
-        issue_date, pt_years, ppt_years, mode, annual_premium, sum_assured,
-        allocations: [(fund, pct)], raw_text, used_ocr: bool
-      }
-    """
     out = {
         "issue_date": None, "pt_years": None, "ppt_years": None, "mode": None,
-        "annual_premium": None, "sum_assured": None, "allocations": [],
-        "raw_text": "", "used_ocr": False
+        "annual_premium": None, "sum_assured": None, "allocations": [], "raw_text": ""
     }
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        all_text = []
+        issue_date_found = None
+        for pidx, page in enumerate(pdf.pages):
+            txt = page.extract_text() or ""
+            all_text.append(txt)
+            if pidx == 0 and not issue_date_found:
+                issue_date_found = _extract_issue_date_anchor(page)
+        full = "\n".join(all_text)
+        out["raw_text"] = full
 
-    text_layer = ""
-    issue_date_anchored = None
+        # Issue date
+        out["issue_date"] = issue_date_found or _first_match(DATE_PATTERNS, full)
 
-    # Try text-layer first (pdfplumber)
-    if HAVE_PDFPLUMBER:
-        try:
-            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-                all_text = []
-                for pidx, page in enumerate(pdf.pages):
-                    txt = page.extract_text() or ""
-                    all_text.append(txt)
-                    if pidx == 0 and not issue_date_anchored:
-                        issue_date_anchored = _extract_issue_date_anchor_pdfplumber(page)
-                text_layer = "\n".join(all_text).strip()
-        except Exception:
-            text_layer = ""
+        # PT / PPT
+        m_pt = re.search(r"(Policy\s*Term|PT)\s*[:\-]?\s*(\d{1,3})\s*(years|yrs)?", full, re.I)
+        if m_pt: out["pt_years"] = int(m_pt.group(2))
+        m_ppt = re.search(r"(Premium\s*Payment\s*Term|PPT)\s*[:\-]?\s*(\d{1,3})\s*(years|yrs)?", full, re.I)
+        if m_ppt: out["ppt_years"] = int(m_ppt.group(2))
 
-    # If no text, try OCR whole PDF
-    if not text_layer:
-        ocr_text = _ocr_whole_pdf(file_bytes)
-        if ocr_text:
-            text_layer = ocr_text
-            out["used_ocr"] = True
+        # Mode
+        m_mode = re.search(r"(Premium\s*Mode|Mode)\s*[:\-]?\s*(Annual|Semi-Annual|Quarterly|Monthly)", full, re.I)
+        if m_mode: out["mode"] = m_mode.group(2).title()
 
-    out["raw_text"] = text_layer
+        # Annual Premium
+        m_ap = re.search(r"(Annual(?:ised)?\s*Premium)[^₹\d]*" + CURRENCY, full, re.I)
+        if m_ap: out["annual_premium"] = _to_number(m_ap.group(1))
 
-    # Issue date priority: anchored via pdfplumber; else OCR header patch; else any date in text
-    if issue_date_anchored:
-        out["issue_date"] = issue_date_anchored
-    else:
-        patch = _ocr_issue_date_by_patch(file_bytes)
-        if patch:
-            out["issue_date"] = patch
-            out["used_ocr"] = True
-        else:
-            out["issue_date"] = _first_match(DATE_PATTERNS, text_layer)
+        # Sum Assured
+        m_sa = re.search(r"(Sum\s*Assured)[^₹\d]*" + CURRENCY, full, re.I)
+        if m_sa: out["sum_assured"] = _to_number(m_sa.group(1))
 
-    # PT / PPT
-    m_pt = re.search(r"(Policy\s*Term|PT)\s*[:\-]?\s*(\d{1,3})\s*(years|yrs)?", text_layer, re.I)
-    if m_pt: out["pt_years"] = int(m_pt.group(2))
-    m_ppt = re.search(r"(Premium\s*Payment\s*Term|PPT)\s*[:\-]?\s*(\d{1,3})\s*(years|yrs)?", text_layer, re.I)
-    if m_ppt: out["ppt_years"] = int(m_ppt.group(2))
-
-    # Mode
-    m_mode = re.search(r"(Premium\s*Mode|Mode)\s*[:\-]?\s*(Annual|Semi-Annual|Quarterly|Monthly)", text_layer, re.I)
-    if m_mode: out["mode"] = m_mode.group(2).title()
-
-    # Annual Premium
-    m_ap = re.search(r"(Annual(?:ised)?\s*Premium)[^₹\d]*" + CURRENCY, text_layer, re.I)
-    if m_ap: out["annual_premium"] = _to_number(m_ap.group(1))
-
-    # Sum Assured
-    m_sa = re.search(r"(Sum\s*Assured)[^₹\d]*" + CURRENCY, text_layer, re.I)
-    if m_sa: out["sum_assured"] = _to_number(m_sa.group(1))
-
-    # Fund allocations (simple pattern: "Fund Name ... 25%")
-    allocations = []
-    for line in text_layer.splitlines():
-        m = re.search(r"([A-Za-z][A-Za-z0-9 \-&]+?)\s+"+PCT+r"$", line.strip())
-        if m:
-            fund = m.group(1).strip()
-            pct = float(m.group(2))
-            if 0.0 <= pct <= 100.0:
-                allocations.append((fund, pct))
-    out["allocations"] = allocations
+        # Fund allocations (simple “Fund … 25%” lines)
+        allocations = []
+        for line in full.splitlines():
+            m = re.search(r"([A-Za-z][A-Za-z0-9 \-&]+?)\s+"+PCT+r"$", line.strip())
+            if m:
+                fund = m.group(1).strip()
+                pct = float(m.group(2))
+                if 0.0 <= pct <= 100.0:
+                    allocations.append((fund, pct))
+        out["allocations"] = allocations
 
     return out
 
 # ===================
-# Projection engine (in-force)
+# In-Force projection engine
 # ===================
 def run_projection_inforce(
     issue_date, valuation_date, ptd_date,
@@ -336,7 +247,7 @@ def run_projection_inforce(
     la_age_today = valuation_date.year - la_dob.year - ((valuation_date.month, valuation_date.day) < (la_dob.month, la_dob.day))
     months   = pt_years * 12
     results  = []
-    CK_prev  = float(fv0_seed)  # seed at valuation
+    CK_prev  = float(fv0_seed)  # seed with today's FV
     CH_hist  = []
 
     # schedule
@@ -354,7 +265,7 @@ def run_projection_inforce(
 
     for m in range(start_month_index, months+1):
         B = math.ceil(m/12)                # Policy Year
-        C = ((m-1)%12)+1                   # Policy Month 1..12
+        C = ((m-1)%12)+1                   # Month 1..12
         D = 1 if B <= pt_years else 0
 
         # Growth regime
@@ -383,7 +294,7 @@ def run_projection_inforce(
         # Pre-COI
         BY = BV - BW - BX
 
-        # DB anchor (not displayed)
+        # DB anchor for SAR math (not displayed)
         BZ = max(sum_assured, BY) if D == 1 else 0.0
         CA = max(BZ - BY, 0.0)
 
@@ -405,7 +316,7 @@ def run_projection_inforce(
         CH = CD + CE - CF - CG
         CH_hist.append(CH)
 
-        # Year-end additions:
+        # Additions:
         CI = 0.0
         CJ = 0.0
         if D == 1 and C == 12:
@@ -420,9 +331,9 @@ def run_projection_inforce(
             else:
                 BA = 0.0
 
-            if status == "DISCONTINUED":
+            if determine_policy_status(issue_date, ptd_date, valuation_date, ppt_years)[0] == "DISCONTINUED":
                 CI, CJ = 0.0, 0.0
-            elif status in ("RPU","FULLY_PAID_UP"):
+            elif determine_policy_status(issue_date, ptd_date, valuation_date, ppt_years)[0] in ("RPU","FULLY_PAID_UP"):
                 CI, CJ = GA + BA, 0.0
             else:  # PREMIUM_PAYING
                 CI = GA + BA
@@ -509,21 +420,16 @@ def partial_withdrawal_availability(df_monthly, pt_years):
 # ===================
 # UI
 # ===================
-st.set_page_config(page_title="Wealth Ultima — In-Force Illustration (PDF + OCR)", layout="wide")
-st.title("Wealth Ultima — In-Force Illustration (PDF-powered, OCR fallback)")
-st.caption("Upload POS PDF → auto-read details. Enter only PTD & Current FV. Growth: 8% continue; 5% in DF (lock-in).")
+st.set_page_config(page_title="Wealth Ultima — In-Force Illustration (PDF-powered)", layout="wide")
+st.title("Wealth Ultima — In-Force Illustration (PDF-powered)")
+st.caption("Upload POS PDF → auto-read details. Enter only PTD & Current FV. Growth: 8% continue; 5% in DF during lock-in discontinuance.")
 
 with st.sidebar:
     st.header("Step 1 — Upload POS PDF")
     pdf_file = st.file_uploader("Upload POS PDF", type=["pdf"])
     parsed = {}
     if pdf_file is not None:
-        file_bytes = pdf_file.read()
-        parsed = parse_pos_pdf(file_bytes)
-        if parsed.get("used_ocr", False):
-            st.info("OCR fallback used to read this PDF.")
-        elif not HAVE_PDFPLUMBER:
-            st.error("pdfplumber not installed; OCR also unavailable. Please install one of them on the server.")
+        parsed = parse_pos_pdf(pdf_file.read())
 
     st.header("Step 2 — Provide only these")
     ptd_date = st.date_input("Paid-to-Date (PTD)")
@@ -534,8 +440,7 @@ st.subheader("Auto-read from PDF (preview)")
 colA, colB, colC = st.columns(3)
 
 _issue_date_raw = parsed.get("issue_date")
-_issue_date = _parse_human_date(_issue_date_raw) if _issue_date_raw else None
-issue_date = _issue_date or dt.date(2018,1,1)
+issue_date = _parse_human_date(_issue_date_raw) if _issue_date_raw else dt.date(2018,1,1)
 pt_years  = int(parsed.get("pt_years") or 26)
 ppt_years = int(parsed.get("ppt_years") or 15)
 mode      = (parsed.get("mode") or "Annual")
@@ -585,8 +490,8 @@ with st.expander("Override parsed values (optional)"):
 else:
     alloc_dict = {fund: pct/100.0 for fund, pct in alloc_from_pdf}
 
-# LA details (if needed)
-with st.expander("Life Assured details (if needed)"):
+# LA (kept in an expander; override if the POS PDF doesn’t have it)
+with st.expander("Life Assured details (only if needed)"):
     la_dob    = st.date_input("Life Assured DOB", value=dt.date(1990,1,1))
     la_gender = st.selectbox("Life Assured Gender", ["Female","Male"], index=0)
 
@@ -622,7 +527,7 @@ if run:
         st.write(f"**Annual Premium:** ₹{format_in_indian_system(annual_premium)}")
         st.write(f"**PT/PPT:** {pt_years} / {ppt_years}")
 
-    # KPIs: EOY of the policy years +2y, +5y from today
+    # KPIs: EOY of policy years that are +2y and +5y from today
     st.subheader("Projection KPIs (EOY, Continue @8%; DF @5% if discontinued in lock-in)")
     py_in_2 = policy_year_today(issue_date, add_years(valuation_date, 2), pt_years)
     py_in_5 = policy_year_today(issue_date, add_years(valuation_date, 5), pt_years)
@@ -657,7 +562,7 @@ if run:
     )
 
     st.subheader("Partial Withdrawal — Eligibility & Maximum Available (EOY)")
-    st.caption("Rules: from 6th policy year; min ₹500; FV after withdrawal ≥ 105% of total premiums paid. Top-up precedence can be added when history is connected.")
+    st.caption("Rules: from 6th policy year; min ₹500; FV after withdrawal ≥ 105% of total premiums paid.")
     pw_tbl = partial_withdrawal_availability(df_m, pt_years=pt_years)
     pw_fmt = pw_tbl.copy()
     pw_fmt["Max_Available"] = pw_fmt["Max_Available"].apply(lambda x: f"₹{format_in_indian_system(x)}" if x else "₹0")
