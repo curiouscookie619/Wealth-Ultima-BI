@@ -471,24 +471,34 @@ else:
     alloc_from_pdf = [(f, 100.0*eq) for f in inv["Fund"].tolist()]
 
 # Optional overrides
-with st.expander("Override parsed values (optional)"):
-    issue_date = st.date_input("Issue Date (override)", value=issue_date)
-    pt_years   = st.number_input("Policy Term (years)", 1, 100, pt_years, 1)
-    ppt_years  = st.number_input("PPT (years)", 1, 100, ppt_years, 1)
-    mode       = st.selectbox("Premium Mode", ["Annual","Semi-Annual","Quarterly","Monthly"],
-                              index=["Annual","Semi-Annual","Quarterly","Monthly"].index(mode))
-    annual_premium = st.number_input("Annualised Premium (₹)", 0.0, 1e12, annual_premium, 1000.0)
-    sum_assured    = st.number_input("Sum Assured (₹)", 0.0, 1e12, sum_assured, 50000.0)
-    st.markdown("**Fund Allocation (edit if needed):**")
-    alloc_dict = {}
-    total = 0.0
-    for fund, pct in alloc_from_pdf:
-        v = st.number_input(fund, 0.0, 100.0, float(pct), 0.5, key=f"alloc_{fund}")
-        alloc_dict[fund] = v/100.0
-        total += v
-    st.write(f"Total: {total:.2f}%")
+# Optional overrides
+override = st.checkbox("Override parsed values (optional)", value=False)
+
+if override:
+    with st.expander("Override parsed values (optional)", expanded=True):
+        issue_date = st.date_input("Issue Date (override)", value=issue_date)
+        pt_years   = st.number_input("Policy Term (years)", 1, 100, pt_years, 1)
+        ppt_years  = st.number_input("PPT (years)", 1, 100, ppt_years, 1)
+        mode       = st.selectbox(
+            "Premium Mode",
+            ["Annual","Semi-Annual","Quarterly","Monthly"],
+            index=["Annual","Semi-Annual","Quarterly","Monthly"].index(mode)
+        )
+        annual_premium = st.number_input("Annualised Premium (₹)", 0.0, 1e12, annual_premium, 1000.0)
+        sum_assured    = st.number_input("Sum Assured (₹)",       0.0, 1e12, sum_assured,    50000.0)
+
+        st.markdown("**Fund Allocation (edit if needed):**")
+        alloc_dict = {}
+        total = 0.0
+        for fund, pct in alloc_from_pdf:
+            v = st.number_input(fund, 0.0, 100.0, float(pct), 0.5, key=f"alloc_{fund}")
+            alloc_dict[fund] = v/100.0
+            total += v
+        st.write(f"Total: {total:.2f}%")
 else:
+    # Build alloc_dict from parsed (read-only)
     alloc_dict = {fund: pct/100.0 for fund, pct in alloc_from_pdf}
+
 
 # LA (kept in an expander; override if the POS PDF doesn’t have it)
 with st.expander("Life Assured details (only if needed)"):
