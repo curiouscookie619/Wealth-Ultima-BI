@@ -1,8 +1,6 @@
-# app.py — Streamlit Cloud–ready In-Force Illustration
-# - Upload POS PDF -> auto-read Issue Date, PT/PPT, Mode, Premium, SA, Allocations
-# - User inputs only PTD + Current FV
-# - Projections: 8% continue, 5% DF (within lock-in if discontinued)
-# - Outputs per your spec
+# app.py — Streamlit Cloud–ready In-Force Illustration (PDF-powered)
+# Upload POS PDF -> auto-read Issue Date, PT/PPT, Mode, Premium, SA, Allocations
+# Enter only PTD + Current FV. Projections: 8% continue; 5% DF in lock-in if discontinued.
 
 import io, re, math, json
 import numpy as np
@@ -11,9 +9,7 @@ import streamlit as st
 from pathlib import Path
 import datetime as dt
 
-# robust human date parsing
 from dateutil import parser as dparser
-# PDF text extraction
 import pdfplumber
 
 # ===================
@@ -28,7 +24,6 @@ CONT_ANNUAL = 0.08   # continue growth
 
 @st.cache_data
 def load_rate_tables():
-    # Put these 4 files in ./data
     charges = pd.read_csv(DATA_DIR / "rates_charges_by_year.csv")
     mort    = pd.read_csv(DATA_DIR / "mortality_grid.csv")
     funds   = pd.read_csv(DATA_DIR / "rates_fund_fmc.csv")
@@ -82,7 +77,6 @@ def format_in_indian_system(num):
     rest = _re.sub(r'(\d)(?=(\d{2})+$)', r'\1,', rest)
     return rest + ',' + last3
 
-# Dates / status
 def add_years(d: dt.date, years: int) -> dt.date:
     try:
         return d.replace(year=d.year + years)
@@ -120,104 +114,165 @@ def determine_policy_status(issue_date: dt.date, ptd_date: dt.date, valuation_da
     return "RPU", lk_end, ppt_end, False
 
 # ===================
-# POS PDF parser (pdfplumber)
+# POS PDF parser (grid + funds table)
 # ===================
-DATE_PATTERNS = [
-    r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b",
-    r"\b(\d{1,2}\s*[A-Za-z]{3,9}\s*\d{2,4})\b",
-    r"\b(\d{1,2}-[A-Za-z]{3}-\d{2,4})\b",
-]
 CURRENCY = r"₹?\s?([\d,]+(?:\.\d{1,2})?)"
 PCT = r"(\d{1,3}(?:\.\d+)?)[ ]*%"
-
-def _first_match(patterns, text: str):
-    for p in patterns:
-        m = re.search(p, text, re.I)
-        if m:
-            return m.group(1).strip()
-    return None
 
 def _to_number(s: str):
     if not s: return None
     s = s.replace(",", "").replace("₹","").strip()
-    try:
-        return float(s)
-    except:
-        return None
+    try: return float(s)
+    except: return None
 
 def _parse_human_date(s: str) -> dt.date | None:
+    """Accepts dd-mm-yy, dd/mm/yy, dd-mmm-yy, dd mmm yyyy, etc.
+       If only month-year is present (rare), defaults day=1.
+       2-digit years -> 2000 + yy (per your rule)."""
     if not s: return None
+    s = s.strip()
+    # Try robust parser first
     try:
-        return dparser.parse(s, dayfirst=True, fuzzy=True).date()
+        d = dparser.parse(s, dayfirst=True, fuzzy=True).date()
+        # normalize 2-digit years into 2000s if needed
+        if d.year < 100: d = dt.date(2000 + d.year, d.month, d.day)
+        return d
     except Exception:
-        for fmt in ("%d-%m-%Y","%d/%m/%Y","%d-%b-%Y","%d %b %Y","%d %B %Y","%d/%m/%y","%d-%m-%y"):
-            try:
-                return dt.datetime.strptime(s, fmt).date()
-            except:
-                continue
+        pass
+    # dd-mm-yy / dd/mm/yy
+    m = re.match(r"^(\d{1,2})[-/](\d{1,2})[-/](\d{2})$", s)
+    if m:
+        dd, mm, yy = map(int, m.groups())
+        return dt.date(2000+yy, mm, dd)
+    # dd-mmm-yy / dd mmm yy
+    m = re.match(r"^(\d{1,2})[ -/]([A-Za-z]{3,9})[ -/](\d{2})$", s)
+    if m:
+        dd = int(m.group(1))
+        mm = dt.datetime.strptime(m.group(2)[:3], "%b").month
+        yy = int(m.group(3))
+        return dt.date(2000+yy, mm, dd)
+    # month-year only (fallback) -> 1st of month
+    m = re.match(r"^(\d{1,2})[-/](\d{2,4})$", s)
+    if m:
+        mm, yy = int(m.group(1)), int(m.group(2))
+        if yy < 100: yy += 2000
+        return dt.date(yy, mm, 1)
+    m = re.match(r"^([A-Za-z]{3,9})[-/](\d{2,4})$", s)
+    if m:
+        mm = dt.datetime.strptime(m.group(1)[:3], "%b").month
+        yy = int(m.group(2))
+        if yy < 100: yy += 2000
+        return dt.date(yy, mm, 1)
     return None
 
-def _extract_issue_date_anchor(page) -> str | None:
-    try:
-        words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
-    except Exception:
-        return None
-    for w in words or []:
-        if w['text'].strip().lower() == 'date':
-            y0, y1 = w['top'], w['bottom']
-            x_right = w['x1']
-            right_words = [
-                rw for rw in words
-                if rw['x0'] > x_right and not (rw['bottom'] < y0 or rw['top'] > y1)
-            ]
-            if right_words:
-                right_words.sort(key=lambda rw: rw['x0'])
-                val = right_words[0]['text'].strip().rstrip(",.;")
-                hit = _first_match(DATE_PATTERNS, val)
-                if hit: return hit
-    return None
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+"," ", s.lower()).strip()
 
 def parse_pos_pdf(file_bytes: bytes):
     out = {
         "issue_date": None, "pt_years": None, "ppt_years": None, "mode": None,
         "annual_premium": None, "sum_assured": None, "allocations": [], "raw_text": ""
     }
+
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         all_text = []
-        issue_date_found = None
+        kv = {}
+        allocations = []
+
         for pidx, page in enumerate(pdf.pages):
             txt = page.extract_text() or ""
             all_text.append(txt)
-            if pidx == 0 and not issue_date_found:
-                issue_date_found = _extract_issue_date_anchor(page)
+
+            # Try to read header date on each page (top-right usually)
+            # Keep the first sensible date we find.
+            if not out["issue_date"]:
+                header_line = txt.splitlines()[0] if txt else ""
+                hit = re.search(r"(\d{1,2}[-/][A-Za-z]{3,9}[-/]\d{2,4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})", header_line)
+                if hit:
+                    out["issue_date"] = hit.group(1)
+
+            # Tables: KV from left grid + allocations table on right
+            try:
+                tables = page.extract_tables() or []
+            except Exception:
+                tables = []
+
+            for tbl in tables:
+                rows = []
+                for r in tbl or []:
+                    if not r: continue
+                    rows.append([(c or "").strip() for c in r])
+
+                # KV capture from first two cells (label, value)
+                for r in rows:
+                    if len(r) >= 2 and r[0] and r[1]:
+                        lab = _norm(r[0])
+                        val = r[1].strip()
+                        if len(lab) > 3 and val:
+                            kv[lab] = val
+
+                # Allocation table detection (has 'Fund' & 'Allocations' in header row)
+                hdr_idx = None
+                for i, r in enumerate(rows):
+                    joined = " | ".join(r).lower()
+                    if "fund" in joined and "allocation" in joined:
+                        hdr_idx = i; break
+                if hdr_idx is not None:
+                    for r in rows[hdr_idx+1:]:
+                        pct_cell = next((c for c in r if re.search(PCT, c or "")), None)
+                        if pct_cell:
+                            m = re.search(PCT, pct_cell)
+                            pct = float(m.group(1))
+                            fund_name = next((c for c in r if isinstance(c, str) and c.strip()), "").strip()
+                            if fund_name and 0 <= pct <= 100:
+                                allocations.append((fund_name, pct))
+
         full = "\n".join(all_text)
         out["raw_text"] = full
 
-        out["issue_date"] = issue_date_found or _first_match(DATE_PATTERNS, full)
+    # Map KV labels to fields
+    def get_kv(*aliases):
+        for a in aliases:
+            v = kv.get(_norm(a))
+            if v: return v
+        return None
 
-        m_pt = re.search(r"(Policy\s*Term|PT)\s*[:\-]?\s*(\d{1,3})\s*(years|yrs)?", full, re.I)
-        if m_pt: out["pt_years"] = int(m_pt.group(2))
-        m_ppt = re.search(r"(Premium\s*Payment\s*Term|PPT)\s*[:\-]?\s*(\d{1,3})\s*(years|yrs)?", full, re.I)
-        if m_ppt: out["ppt_years"] = int(m_ppt.group(2))
+    pt_val  = get_kv("Policy Term (in Years)", "Policy Term in Years", "Policy Term")
+    ppt_val = get_kv("Premium Payment Term (in Years)", "Premium Payment Term in Years", "PPT")
+    try: out["pt_years"]  = int(re.search(r"\d{1,3}", pt_val).group(0)) if pt_val else None
+    except: pass
+    try: out["ppt_years"] = int(re.search(r"\d{1,3}", ppt_val).group(0)) if ppt_val else None
+    except: pass
 
-        m_mode = re.search(r"(Premium\s*Mode|Mode)\s*[:\-]?\s*(Annual|Semi-Annual|Quarterly|Monthly)", full, re.I)
-        if m_mode: out["mode"] = m_mode.group(2).title()
+    mode_val = get_kv("Mode of payment of premium", "Premium Mode", "Mode")
+    if mode_val:
+        mv = mode_val.strip().title()
+        if mv in ("Annual","Semi-Annual","Quarterly","Monthly"):
+            out["mode"] = mv
 
-        m_ap = re.search(r"(Annual(?:ised)?\s*Premium)[^₹\d]*" + CURRENCY, full, re.I)
-        if m_ap: out["annual_premium"] = _to_number(m_ap.group(1))
+    ap_val = (get_kv("Annualized Premium (in Rupees)", "Annualised Premium (in Rupees)")
+              or get_kv("Annualized Premium in Rupees", "Annualised Premium in Rupees")
+              or get_kv("Amount of Instalment Premium (in Rupees)"))
+    out["annual_premium"] = _to_number(ap_val)
 
-        m_sa = re.search(r"(Sum\s*Assured)[^₹\d]*" + CURRENCY, full, re.I)
-        if m_sa: out["sum_assured"] = _to_number(m_sa.group(1))
+    sa_val = get_kv("Sum Assured (in Rupees)", "Sum Assured in Rupees", "Sum Assured")
+    out["sum_assured"] = _to_number(sa_val)
 
-        allocations = []
-        for line in full.splitlines():
-            m = re.search(r"([A-Za-z][A-Za-z0-9 \-&]+?)\s+"+PCT+r"$", line.strip())
+    if not out["issue_date"]:
+        # fallback: first date-like token in full text
+        m = re.search(r"(\d{1,2}[-/][A-Za-z]{3,9}[-/]\d{2,4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})", out["raw_text"])
+        if m: out["issue_date"] = m.group(1)
+
+    out["allocations"] = allocations
+    if not out["allocations"]:
+        for line in out["raw_text"].splitlines():
+            line = line.strip()
+            m = re.search(r"([A-Za-z][A-Za-z0-9 \-&/]+?)\s+"+PCT+r"$", line)
             if m:
                 fund = m.group(1).strip()
-                pct = float(m.group(2))
-                if 0.0 <= pct <= 100.0:
-                    allocations.append((fund, pct))
-        out["allocations"] = allocations
+                pct  = float(m.group(2))
+                if 0 <= pct <= 100:
+                    out["allocations"].append((fund, pct))
 
     return out
 
@@ -237,10 +292,9 @@ def run_projection_inforce(
     la_age_today = valuation_date.year - la_dob.year - ((valuation_date.month, valuation_date.day) < (la_dob.month, la_dob.day))
     months   = pt_years * 12
     results  = []
-    CK_prev  = float(fv0_seed)  # seed with today's FV
+    CK_prev  = float(fv0_seed)
     CH_hist  = []
 
-    # schedule
     if mode == "Annual":      N, scheduled = 1,  [1]
     elif mode == "Semi-Annual": N, scheduled = 2, [1,7]
     elif mode == "Quarterly":   N, scheduled = 4, [1,4,7,10]
@@ -249,13 +303,12 @@ def run_projection_inforce(
 
     fmc_effective = sumproduct_fmc(allocation_dict)
 
-    # Start from next policy month after valuation
     start_month_index = months_between(issue_date, valuation_date) + 1
     start_month_index = max(1, start_month_index)
 
     for m in range(start_month_index, months+1):
-        B = math.ceil(m/12)                # Policy Year
-        C = ((m-1)%12)+1                   # Month 1..12
+        B = math.ceil(m/12)
+        C = ((m-1)%12)+1
         D = 1 if B <= pt_years else 0
 
         annual_r = DF_ANNUAL if (status == "DISCONTINUED" and B <= 5) else CONT_ANNUAL
@@ -265,47 +318,35 @@ def run_projection_inforce(
         F_rate, admin_rate, K = r["F"], r["admin_rate"], r["K"]
         F_rate = min(max(F_rate, 0.0), 1.0)
 
-        # premiums only in Premium-Paying
         F = installment if (status == "PREMIUM_PAYING" and B <= ppt_years and C in scheduled) else 0.0
 
-        # allocation & GST
         BS = F_rate * F * D
         BT = BS * SERVICE_TAX
         BU = F - BS - BT
 
-        # fund at start
         BV = (CK_prev + BU) * D
 
-        # admin & GST
         BW = ((admin_rate * annual_premium) / 12.0) * D
         BX = BW * SERVICE_TAX
 
-        # pre-COI
         BY = BV - BW - BX
 
-        # DB anchor (not displayed)
         BZ = max(sum_assured, BY) if D == 1 else 0.0
         CA = max(BZ - BY, 0.0)
 
-        # mortality & GST
         CB = CA * (K / 12000.0) * COI_SCALER * D
         CC = CB * COI_GST
 
-        # post-COI
         CD = BY - CB - CC
 
-        # growth
         CE = CD * MR * D
 
-        # FMC + GST
         CF = (CD + CE) * (fmc_effective / 12.0)
         CG = CF * SERVICE_TAX
 
-        # pre-additions
         CH = CD + CE - CF - CG
         CH_hist.append(CH)
 
-        # additions
         CI = 0.0
         CJ = 0.0
         if D == 1 and C == 12:
@@ -324,7 +365,7 @@ def run_projection_inforce(
                 CI, CJ = 0.0, 0.0
             elif status in ("RPU","FULLY_PAID_UP"):
                 CI, CJ = GA + BA, 0.0
-            else:  # PREMIUM_PAYING
+            else:
                 CI = GA + BA
                 if B >= 6:
                     if ppt_years == 5:
@@ -424,8 +465,19 @@ with st.sidebar:
     ptd_date = st.date_input("Paid-to-Date (PTD)")
     fv0_seed = st.number_input("Fund Value Today (₹)", 0.0, 1e12, 0.0, 1000.0, format="%.2f")
 
-# Parsed → defaults (preview)
+# Preview (with debug expander)
 st.subheader("Auto-read from PDF (preview)")
+with st.expander("Show parsed fields (debug)"):
+    st.json({
+        "issue_date_raw": parsed.get("issue_date"),
+        "pt_years": parsed.get("pt_years"),
+        "ppt_years": parsed.get("ppt_years"),
+        "mode": parsed.get("mode"),
+        "annual_premium_raw": parsed.get("annual_premium"),
+        "sum_assured_raw": parsed.get("sum_assured"),
+        "allocations": parsed.get("allocations", [])[:10],
+    })
+
 colA, colB, colC = st.columns(3)
 
 _issue_date_raw = parsed.get("issue_date")
@@ -459,7 +511,6 @@ else:
     eq = 1.0 / max(1, len(inv))
     alloc_from_pdf = [(f, 100.0*eq) for f in inv["Fund"].tolist()]
 
-# ----------- Optional overrides (FIXED: no with...else) -----------
 override = st.checkbox("Override parsed values (optional)", value=False)
 if override:
     with st.expander("Override parsed values (optional)", expanded=True):
@@ -484,9 +535,7 @@ if override:
         st.write(f"Total: {total:.2f}%")
 else:
     alloc_dict = {fund: pct/100.0 for fund, pct in alloc_from_pdf}
-# ----------- end overrides -----------
 
-# LA details
 with st.expander("Life Assured details (only if needed)"):
     la_dob    = st.date_input("Life Assured DOB", value=dt.date(1990,1,1))
     la_gender = st.selectbox("Life Assured Gender", ["Female","Male"], index=0)
@@ -523,7 +572,6 @@ if run:
         st.write(f"**Annual Premium:** ₹{format_in_indian_system(annual_premium)}")
         st.write(f"**PT/PPT:** {pt_years} / {ppt_years}")
 
-    # KPIs: EOY of policy years that are +2y and +5y from today
     st.subheader("Projection KPIs (EOY, Continue @8%; DF @5% if discontinued in lock-in)")
     py_in_2 = policy_year_today(issue_date, add_years(valuation_date, 2), pt_years)
     py_in_5 = policy_year_today(issue_date, add_years(valuation_date, 5), pt_years)
