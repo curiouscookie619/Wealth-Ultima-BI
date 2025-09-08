@@ -15,18 +15,18 @@ import pdfplumber
 # ===================
 # Data & constants
 # ===================
-DATA_DIR    = Path(__file__).parent / "data"
+DATA_DIR = Path(__file__).parent / "data"
 SERVICE_TAX = 0.18
-COI_GST     = 0.18
-COI_SCALER  = 1.0
-DF_ANNUAL   = 0.05   # discontinuance fund growth (lock-in)
-CONT_ANNUAL = 0.08   # continue growth
+COI_GST = 0.18
+COI_SCALER = 1.0
+DF_ANNUAL = 0.05 # discontinuance fund growth (lock-in)
+CONT_ANNUAL = 0.08 # continue growth
 
 @st.cache_data
 def load_rate_tables():
     charges = pd.read_csv(DATA_DIR / "rates_charges_by_year.csv")
-    mort    = pd.read_csv(DATA_DIR / "mortality_grid.csv")
-    funds   = pd.read_csv(DATA_DIR / "rates_fund_fmc.csv")
+    mort = pd.read_csv(DATA_DIR / "mortality_grid.csv")
+    funds = pd.read_csv(DATA_DIR / "rates_fund_fmc.csv")
     windows = json.loads((DATA_DIR / "windows.json").read_text())
     return charges, mort, funds, windows
 
@@ -40,7 +40,7 @@ def monthly_rate_from_annual(annual: float) -> float:
 
 def mortality_rate_per_thousand(age, gender):
     age = max(int(age), int(MORT_DF["Age"].min()))
-    age = min(age,       int(MORT_DF["Age"].max()))
+    age = min(age, int(MORT_DF["Age"].max()))
     row = MORT_DF.loc[MORT_DF["Age"] == age].iloc[0]
     return float(row["Female_perThousand"] if str(gender).lower().startswith("f") else row["Male_perThousand"])
 
@@ -237,9 +237,9 @@ def parse_pos_pdf(file_bytes: bytes):
             if v: return v
         return None
 
-    pt_val  = get_kv("Policy Term (in Years)", "Policy Term in Years", "Policy Term")
+    pt_val = get_kv("Policy Term (in Years)", "Policy Term in Years", "Policy Term")
     ppt_val = get_kv("Premium Payment Term (in Years)", "Premium Payment Term in Years", "PPT")
-    try: out["pt_years"]  = int(re.search(r"\d{1,3}", pt_val).group(0)) if pt_val else None
+    try: out["pt_years"] = int(re.search(r"\d{1,3}", pt_val).group(0)) if pt_val else None
     except: pass
     try: out["ppt_years"] = int(re.search(r"\d{1,3}", ppt_val).group(0)) if ppt_val else None
     except: pass
@@ -270,7 +270,7 @@ def parse_pos_pdf(file_bytes: bytes):
             m = re.search(r"([A-Za-z][A-Za-z0-9 \-&/]+?)\s+"+PCT+r"$", line)
             if m:
                 fund = m.group(1).strip()
-                pct  = float(m.group(2))
+                pct = float(m.group(2))
                 if 0 <= pct <= 100:
                     out["allocations"].append((fund, pct))
 
@@ -290,15 +290,15 @@ def run_projection_inforce(
     status, lk_end, ppt_end, in_lockin = determine_policy_status(issue_date, ptd_date, valuation_date, ppt_years)
 
     la_age_today = valuation_date.year - la_dob.year - ((valuation_date.month, valuation_date.day) < (la_dob.month, la_dob.day))
-    months   = pt_years * 12
-    results  = []
-    CK_prev  = float(fv0_seed)
-    CH_hist  = []
+    months = pt_years * 12
+    results = []
+    CK_prev = float(fv0_seed)
+    CH_hist = []
 
-    if mode == "Annual":      N, scheduled = 1,  [1]
+    if mode == "Annual": N, scheduled = 1, [1]
     elif mode == "Semi-Annual": N, scheduled = 2, [1,7]
-    elif mode == "Quarterly":   N, scheduled = 4, [1,4,7,10]
-    else:                       N, scheduled = 12, list(range(1,13))
+    elif mode == "Quarterly": N, scheduled = 4, [1,4,7,10]
+    else: N, scheduled = 12, list(range(1,13))
     installment = annual_premium / N if N > 0 else annual_premium
 
     fmc_effective = sumproduct_fmc(allocation_dict)
@@ -482,11 +482,11 @@ colA, colB, colC = st.columns(3)
 
 _issue_date_raw = parsed.get("issue_date")
 issue_date = _parse_human_date(_issue_date_raw) if _issue_date_raw else dt.date(2018,1,1)
-pt_years  = int(parsed.get("pt_years") or 26)
+pt_years = int(parsed.get("pt_years") or 26)
 ppt_years = int(parsed.get("ppt_years") or 15)
-mode      = (parsed.get("mode") or "Annual")
+mode = (parsed.get("mode") or "Annual")
 annual_premium = float(parsed.get("annual_premium") or 250000.0)
-sum_assured    = float(parsed.get("sum_assured") or 4000000.0)
+sum_assured = float(parsed.get("sum_assured") or 4000000.0)
 alloc_from_pdf = parsed.get("allocations", [])
 
 with colA:
@@ -515,15 +515,15 @@ override = st.checkbox("Override parsed values (optional)", value=False)
 if override:
     with st.expander("Override parsed values (optional)", expanded=True):
         issue_date = st.date_input("Issue Date (override)", value=issue_date)
-        pt_years   = st.number_input("Policy Term (years)", 1, 100, pt_years, 1)
-        ppt_years  = st.number_input("PPT (years)", 1, 100, ppt_years, 1)
-        mode       = st.selectbox(
+        pt_years = st.number_input("Policy Term (years)", 1, 100, pt_years, 1)
+        ppt_years = st.number_input("PPT (years)", 1, 100, ppt_years, 1)
+        mode = st.selectbox(
             "Premium Mode",
             ["Annual","Semi-Annual","Quarterly","Monthly"],
             index=["Annual","Semi-Annual","Quarterly","Monthly"].index(mode),
         )
         annual_premium = st.number_input("Annualised Premium (₹)", 0.0, 1e12, annual_premium, 1000.0)
-        sum_assured    = st.number_input("Sum Assured (₹)",       0.0, 1e12, sum_assured,    50000.0)
+        sum_assured = st.number_input("Sum Assured (₹)", 0.0, 1e12, sum_assured, 50000.0)
 
         st.markdown("**Fund Allocation (edit if needed):**")
         alloc_dict = {}
@@ -537,7 +537,7 @@ else:
     alloc_dict = {fund: pct/100.0 for fund, pct in alloc_from_pdf}
 
 with st.expander("Life Assured details (only if needed)"):
-    la_dob    = st.date_input("Life Assured DOB", value=dt.date(1990,1,1))
+    la_dob = st.date_input("Life Assured DOB", value=dt.date(1990,1,1))
     la_gender = st.selectbox("Life Assured Gender", ["Female","Male"], index=0)
 
 run = st.button("Generate In-Force Tables", type="primary")
