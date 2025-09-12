@@ -1,8 +1,9 @@
 # app.py — Streamlit Cloud–ready In-Force Illustration (PDF-powered)
 # Upload POS PDF -> auto-read Issue Date, PT/PPT, Mode, Premium, SA, Allocations, LA Name
 # Enter only PTD + Current FV. Projections: 8% continue; 5% DF in lock-in if discontinued.
-# CURRENT CHANGES:
+# LATEST CHANGES:
 #  - Snapshot shows LA name
+#  - Snapshot shows projected totals of GA+BA, Loyalty, and Total (from today to PT end)
 #  - Yearly Projection table removed; replaced with FV (EOY) line graph only
 #  - No "charges % of FV" anywhere
 
@@ -570,21 +571,35 @@ if run:
         fv0_seed=fv0_seed
     )
 
+    # --- NEW: totals of additions from today -> end of PT (based on the current projection df_m)
+    total_GA_BA = float(df_m["CI_raw"].sum())          # GA + BA packed in CI_raw
+    total_Loyalty = float(df_m["CJ_raw"].sum())        # Loyalty in CJ_raw
+    total_additions = total_GA_BA + total_Loyalty
+
     st.subheader("Snapshot")
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)   # changed from 3 to 4
+
     with c1:
         st.write(f"**Life Assured:** {la_name}")
         st.write(f"**Issue Date:** {issue_date.strftime('%d-%b-%Y')}")
         st.write(f"**Valuation Date:** {valuation_date.strftime('%d-%b-%Y')}")
         st.write(f"**Lock-in End:** {lk_end.strftime('%d-%b-%Y')}")
+
     with c2:
         st.write(f"**Status (computed):** {status}")
         st.write(f"**PPT End:** {ppt_end.strftime('%d-%b-%Y')}")
         st.write(f"**Mode:** {mode}")
+
     with c3:
         st.write(f"**Fund Value Today:** ₹{format_in_indian_system(fv0_seed)}")
         st.write(f"**Annual Premium:** ₹{format_in_indian_system(annual_premium)}")
         st.write(f"**PT / PPT:** {pt_years} / {ppt_years}")
+
+    with c4:
+        st.write("**Projected Additions (from today → PT end)**")
+        st.write(f"- GA + BA: ₹{format_in_indian_system(total_GA_BA)}")
+        st.write(f"- Loyalty: ₹{format_in_indian_system(total_Loyalty)}")
+        st.write(f"**Total:** ₹{format_in_indian_system(total_additions)}")
 
     st.subheader("Projection KPIs (EOY, Continue @8%; DF @5% if discontinued in lock-in)")
     py_in_2 = policy_year_today(issue_date, add_years(valuation_date, 2), pt_years)
@@ -620,7 +635,6 @@ if run:
         lambda x: None if pd.isna(x) else float(x)
     )
 
-    # Plot: Streamlit's native line_chart
     st.line_chart(
         data=graph_df.set_index("Year")["FV_EOY_Display"],
         use_container_width=True
