@@ -1,6 +1,10 @@
 # app.py — Streamlit Cloud–ready In-Force Illustration (PDF-powered)
-# Upload POS PDF -> auto-read Issue Date, PT/PPT, Mode, Premium, SA, Allocations
+# Upload POS PDF -> auto-read Issue Date, PT/PPT, Mode, Premium, SA, Allocations, LA Name
 # Enter only PTD + Current FV. Projections: 8% continue; 5% DF in lock-in if discontinued.
+# Changes per request:
+#  - Snapshot shows LA name
+#  - Yearly Projection table replaced with a line graph of FV (EOY) till PT end
+#  - Removed "Charges as % of FV"
 
 import io, re, math, json
 import numpy as np
@@ -15,18 +19,18 @@ import pdfplumber
 # ===================
 # Data & constants
 # ===================
-DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR    = Path(__file__).parent / "data"
 SERVICE_TAX = 0.18
-COI_GST = 0.18
-COI_SCALER = 1.0
-DF_ANNUAL = 0.05 # discontinuance fund growth (lock-in)
-CONT_ANNUAL = 0.08 # continue growth
+COI_GST     = 0.18
+COI_SCALER  = 1.0
+DF_ANNUAL   = 0.05   # discontinuance fund growth (lock-in)
+CONT_ANNUAL = 0.08   # continue growth
 
 @st.cache_data
 def load_rate_tables():
     charges = pd.read_csv(DATA_DIR / "rates_charges_by_year.csv")
-    mort = pd.read_csv(DATA_DIR / "mortality_grid.csv")
-    funds = pd.read_csv(DATA_DIR / "rates_fund_fmc.csv")
+    mort    = pd.read_csv(DATA_DIR / "mortality_grid.csv")
+    funds   = pd.read_csv(DATA_DIR / "rates_fund_fmc.csv")
     windows = json.loads((DATA_DIR / "windows.json").read_text())
     return charges, mort, funds, windows
 
@@ -40,7 +44,7 @@ def monthly_rate_from_annual(annual: float) -> float:
 
 def mortality_rate_per_thousand(age, gender):
     age = max(int(age), int(MORT_DF["Age"].min()))
-    age = min(age, int(MORT_DF["Age"].max()))
+    age = min(age,       int(MORT_DF["Age"].max()))
     row = MORT_DF.loc[MORT_DF["Age"] == age].iloc[0]
     return float(row["Female_perThousand"] if str(gender).lower().startswith("f") else row["Male_perThousand"])
 
@@ -125,16 +129,16 @@ def _to_number(s: str):
     try: return float(s)
     except: return None
 
-def _parse_human_date(s: str) -> dt.date | None:
+def _parse_human_date(s: str) -> dt.date:
     """Accepts dd-mm-yy, dd/mm/yy, dd-mmm-yy, dd mmm yyyy, etc.
        If only month-year is present (rare), defaults day=1.
-       2-digit years -> 2000 + yy (per your rule)."""
-    if not s: return None
+       2-digit years -> 2000 + yy."""
+    if not s: 
+        return None
     s = s.strip()
     # Try robust parser first
     try:
         d = dparser.parse(s, dayfirst=True, fuzzy=True).date()
-        # normalize 2-digit years into 2000s if needed
         if d.year < 100: d = dt.date(2000 + d.year, d.month, d.day)
         return d
     except Exception:
@@ -171,7 +175,8 @@ def _norm(s: str) -> str:
 def parse_pos_pdf(file_bytes: bytes):
     out = {
         "issue_date": None, "pt_years": None, "ppt_years": None, "mode": None,
-        "annual_premium": None, "sum_assured": None, "allocations": [], "raw_text": ""
+        "annual_premium": None, "sum_assured": None, "allocations": [], "raw_text": "",
+        "la_name": None
     }
 
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
@@ -183,8 +188,7 @@ def parse_pos_pdf(file_bytes: bytes):
             txt = page.extract_text() or ""
             all_text.append(txt)
 
-            # Try to read header date on each page (top-right usually)
-            # Keep the first sensible date we find.
+            # Try header date (top line)
             if not out["issue_date"]:
                 header_line = txt.splitlines()[0] if txt else ""
                 hit = re.search(r"(\d{1,2}[-/][A-Za-z]{3,9}[-/]\d{2,4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})", header_line)
@@ -203,7 +207,7 @@ def parse_pos_pdf(file_bytes: bytes):
                     if not r: continue
                     rows.append([(c or "").strip() for c in r])
 
-                # KV capture from first two cells (label, value)
+                # KV capture (label : value)
                 for r in rows:
                     if len(r) >= 2 and r[0] and r[1]:
                         lab = _norm(r[0])
@@ -211,7 +215,7 @@ def parse_pos_pdf(file_bytes: bytes):
                         if len(lab) > 3 and val:
                             kv[lab] = val
 
-                # Allocation table detection (has 'Fund' & 'Allocations' in header row)
+                # Allocation table detection (has 'Fund' & 'Allocation' in header row)
                 hdr_idx = None
                 for i, r in enumerate(rows):
                     joined = " | ".join(r).lower()
@@ -237,19 +241,26 @@ def parse_pos_pdf(file_bytes: bytes):
             if v: return v
         return None
 
-    pt_val = get_kv("Policy Term (in Years)", "Policy Term in Years", "Policy Term")
+    # LA name
+    la_name_val = get_kv("Name of the Life Assured", "Name of Life Assured", "Life Assured", "LA Name")
+    out["la_name"] = la_name_val
+
+    # PT / PPT
+    pt_val  = get_kv("Policy Term (in Years)", "Policy Term in Years", "Policy Term")
     ppt_val = get_kv("Premium Payment Term (in Years)", "Premium Payment Term in Years", "PPT")
-    try: out["pt_years"] = int(re.search(r"\d{1,3}", pt_val).group(0)) if pt_val else None
+    try: out["pt_years"]  = int(re.search(r"\d{1,3}", pt_val).group(0)) if pt_val else None
     except: pass
     try: out["ppt_years"] = int(re.search(r"\d{1,3}", ppt_val).group(0)) if ppt_val else None
     except: pass
 
+    # Mode
     mode_val = get_kv("Mode of payment of premium", "Premium Mode", "Mode")
     if mode_val:
         mv = mode_val.strip().title()
         if mv in ("Annual","Semi-Annual","Quarterly","Monthly"):
             out["mode"] = mv
 
+    # AP / SA
     ap_val = (get_kv("Annualized Premium (in Rupees)", "Annualised Premium (in Rupees)")
               or get_kv("Annualized Premium in Rupees", "Annualised Premium in Rupees")
               or get_kv("Amount of Instalment Premium (in Rupees)"))
@@ -258,8 +269,8 @@ def parse_pos_pdf(file_bytes: bytes):
     sa_val = get_kv("Sum Assured (in Rupees)", "Sum Assured in Rupees", "Sum Assured")
     out["sum_assured"] = _to_number(sa_val)
 
+    # Issue date fallback
     if not out["issue_date"]:
-        # fallback: first date-like token in full text
         m = re.search(r"(\d{1,2}[-/][A-Za-z]{3,9}[-/]\d{2,4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})", out["raw_text"])
         if m: out["issue_date"] = m.group(1)
 
@@ -270,7 +281,7 @@ def parse_pos_pdf(file_bytes: bytes):
             m = re.search(r"([A-Za-z][A-Za-z0-9 \-&/]+?)\s+"+PCT+r"$", line)
             if m:
                 fund = m.group(1).strip()
-                pct = float(m.group(2))
+                pct  = float(m.group(2))
                 if 0 <= pct <= 100:
                     out["allocations"].append((fund, pct))
 
@@ -290,15 +301,15 @@ def run_projection_inforce(
     status, lk_end, ppt_end, in_lockin = determine_policy_status(issue_date, ptd_date, valuation_date, ppt_years)
 
     la_age_today = valuation_date.year - la_dob.year - ((valuation_date.month, valuation_date.day) < (la_dob.month, la_dob.day))
-    months = pt_years * 12
-    results = []
-    CK_prev = float(fv0_seed)
-    CH_hist = []
+    months   = pt_years * 12
+    results  = []
+    CK_prev  = float(fv0_seed)
+    CH_hist  = []
 
-    if mode == "Annual": N, scheduled = 1, [1]
+    if mode == "Annual":      N, scheduled = 1,  [1]
     elif mode == "Semi-Annual": N, scheduled = 2, [1,7]
-    elif mode == "Quarterly": N, scheduled = 4, [1,4,7,10]
-    else: N, scheduled = 12, list(range(1,13))
+    elif mode == "Quarterly":   N, scheduled = 4, [1,4,7,10]
+    else:                       N, scheduled = 12, list(range(1,13))
     installment = annual_premium / N if N > 0 else annual_premium
 
     fmc_effective = sumproduct_fmc(allocation_dict)
@@ -396,23 +407,22 @@ def run_projection_inforce(
     return pd.DataFrame(results), status, lockin_end_date(issue_date), ppt_end_date(issue_date, ppt_years)
 
 # ===================
-# Output builders
+# Output builders (graph data)
 # ===================
-def yearly_fv_and_chargepct(df_monthly):
-    grp = df_monthly.groupby("Year", as_index=False).agg(
-        BS=("BS_raw","sum"), BT=("BT_raw","sum"),
-        BW=("BW_raw","sum"), BX=("BX_raw","sum"),
-        CB=("CB_raw","sum"), CC=("CC_raw","sum"),
-        CF=("CF_raw","sum"), CG=("CG_raw","sum"),
+def yearly_fv_series(df_monthly, pt_years):
+    """Return a tidy DF with Policy Year and FV_EOY for graphing."""
+    eoy = (
+        df_monthly[df_monthly["Month"] == 12]
+        .loc[:, ["Year","CK_raw"]]
+        .rename(columns={"CK_raw":"FV_EOY"})
+        .drop_duplicates(subset=["Year"])
+        .sort_values("Year")
     )
-    eoy = df_monthly[df_monthly["Month"] == 12].loc[:, ["Year","CK_raw"]].rename(columns={"CK_raw":"FV_EOY"})
-    out = grp.merge(eoy, on="Year", how="left")
-    out["Total_Charges"] = out[["BS","BT","BW","BX","CB","CC","CF","CG"]].sum(axis=1)
-    out["Charges_pct_of_FV"] = np.where(out["FV_EOY"]>0, (out["Total_Charges"]/out["FV_EOY"])*100.0, 0.0)
-    tbl = out.loc[:, ["Year","FV_EOY","Charges_pct_of_FV"]].copy()
-    tbl["FV_EOY"] = tbl["FV_EOY"].round(0).astype("Int64")
-    tbl["Charges_pct_of_FV"] = tbl["Charges_pct_of_FV"].round(2)
-    return tbl
+    # ensure we have rows 1..pt_years (fill NA with np.nan)
+    idx = pd.Index(range(1, pt_years+1), name="Year")
+    eoy = eoy.set_index("Year").reindex(idx)
+    eoy = eoy.reset_index()
+    return eoy  # columns: Year, FV_EOY (float or NaN)
 
 def fv_at_year_eoy(df_monthly, year_n: int):
     row = df_monthly[(df_monthly["Month"]==12) & (df_monthly["Year"]==year_n)]
@@ -469,6 +479,7 @@ with st.sidebar:
 st.subheader("Auto-read from PDF (preview)")
 with st.expander("Show parsed fields (debug)"):
     st.json({
+        "life_assured_name": parsed.get("la_name"),
         "issue_date_raw": parsed.get("issue_date"),
         "pt_years": parsed.get("pt_years"),
         "ppt_years": parsed.get("ppt_years"),
@@ -482,14 +493,16 @@ colA, colB, colC = st.columns(3)
 
 _issue_date_raw = parsed.get("issue_date")
 issue_date = _parse_human_date(_issue_date_raw) if _issue_date_raw else dt.date(2018,1,1)
-pt_years = int(parsed.get("pt_years") or 26)
+pt_years  = int(parsed.get("pt_years") or 26)
 ppt_years = int(parsed.get("ppt_years") or 15)
-mode = (parsed.get("mode") or "Annual")
+mode      = (parsed.get("mode") or "Annual")
 annual_premium = float(parsed.get("annual_premium") or 250000.0)
-sum_assured = float(parsed.get("sum_assured") or 4000000.0)
+sum_assured    = float(parsed.get("sum_assured") or 4000000.0)
 alloc_from_pdf = parsed.get("allocations", [])
+la_name        = parsed.get("la_name") or "—"
 
 with colA:
+    st.write(f"**Life Assured:** {la_name}")
     st.write(f"**Issue Date:** {issue_date.strftime('%d-%b-%Y')}")
     st.write(f"**PT / PPT:** {pt_years} / {ppt_years}")
 with colB:
@@ -515,15 +528,16 @@ override = st.checkbox("Override parsed values (optional)", value=False)
 if override:
     with st.expander("Override parsed values (optional)", expanded=True):
         issue_date = st.date_input("Issue Date (override)", value=issue_date)
-        pt_years = st.number_input("Policy Term (years)", 1, 100, pt_years, 1)
-        ppt_years = st.number_input("PPT (years)", 1, 100, ppt_years, 1)
-        mode = st.selectbox(
+        pt_years   = st.number_input("Policy Term (years)", 1, 100, pt_years, 1)
+        ppt_years  = st.number_input("PPT (years)", 1, 100, ppt_years, 1)
+        mode       = st.selectbox(
             "Premium Mode",
             ["Annual","Semi-Annual","Quarterly","Monthly"],
             index=["Annual","Semi-Annual","Quarterly","Monthly"].index(mode),
         )
         annual_premium = st.number_input("Annualised Premium (₹)", 0.0, 1e12, annual_premium, 1000.0)
-        sum_assured = st.number_input("Sum Assured (₹)", 0.0, 1e12, sum_assured, 50000.0)
+        sum_assured    = st.number_input("Sum Assured (₹)",       0.0, 1e12, sum_assured,    50000.0)
+        la_name        = st.text_input("Life Assured Name", value=la_name)
 
         st.markdown("**Fund Allocation (edit if needed):**")
         alloc_dict = {}
@@ -537,10 +551,10 @@ else:
     alloc_dict = {fund: pct/100.0 for fund, pct in alloc_from_pdf}
 
 with st.expander("Life Assured details (only if needed)"):
-    la_dob = st.date_input("Life Assured DOB", value=dt.date(1990,1,1))
+    la_dob    = st.date_input("Life Assured DOB", value=dt.date(1990,1,1))
     la_gender = st.selectbox("Life Assured Gender", ["Female","Male"], index=0)
 
-run = st.button("Generate In-Force Tables", type="primary")
+run = st.button("Generate In-Force Projection", type="primary")
 
 if run:
     if abs(sum(alloc_dict.values()) - 1.0) > 1e-6:
@@ -560,6 +574,7 @@ if run:
     st.subheader("Snapshot")
     c1, c2, c3 = st.columns(3)
     with c1:
+        st.write(f"**Life Assured:** {la_name}")
         st.write(f"**Issue Date:** {issue_date.strftime('%d-%b-%Y')}")
         st.write(f"**Valuation Date:** {valuation_date.strftime('%d-%b-%Y')}")
         st.write(f"**Lock-in End:** {lk_end.strftime('%d-%b-%Y')}")
@@ -570,7 +585,7 @@ if run:
     with c3:
         st.write(f"**Fund Value Today:** ₹{format_in_indian_system(fv0_seed)}")
         st.write(f"**Annual Premium:** ₹{format_in_indian_system(annual_premium)}")
-        st.write(f"**PT/PPT:** {pt_years} / {ppt_years}")
+        st.write(f"**PT / PPT:** {pt_years} / {ppt_years}")
 
     st.subheader("Projection KPIs (EOY, Continue @8%; DF @5% if discontinued in lock-in)")
     py_in_2 = policy_year_today(issue_date, add_years(valuation_date, 2), pt_years)
@@ -596,19 +611,22 @@ if run:
                 f"→ **Δ = ₹{format_in_indian_system(delta)}**"
             )
 
-    st.subheader("Yearly Projection (End-of-Year)")
-    yr_tbl = yearly_fv_and_chargepct(df_m)
-    yr_fmt = yr_tbl.copy()
-    yr_fmt["FV_EOY"] = yr_fmt["FV_EOY"].apply(lambda x: format_in_indian_system(x) if pd.notnull(x) else "—")
-    st.dataframe(
-        yr_fmt.rename(columns={
-            "Year":"Policy Year",
-            "FV_EOY":"Fund Value at Year End",
-            "Charges_pct_of_FV":"Charges as % of FV"
-        }),
+    # ------- FV Graph (EOY) till PT end -------
+    st.subheader("Fund Value at End of Each Policy Year")
+    eoy_series = yearly_fv_series(df_m, pt_years=pt_years)
+    # Prepare display-friendly DF
+    graph_df = eoy_series.copy()
+    graph_df["FV_EOY_Display"] = graph_df["FV_EOY"].apply(
+        lambda x: None if pd.isna(x) else float(x)
+    )
+    # Plot: Streamlit's native line_chart
+    st.line_chart(
+        data=graph_df.set_index("Year")["FV_EOY_Display"],
         use_container_width=True
     )
+    st.caption("Graph shows projected Fund Value at the end of each policy year from current year until PT end.")
 
+    # ------- Partial Withdrawals -------
     st.subheader("Partial Withdrawal — Eligibility & Maximum Available (EOY)")
     st.caption("Rules: from 6th policy year; min ₹500; FV after withdrawal ≥ 105% of total premiums paid.")
     pw_tbl = partial_withdrawal_availability(df_m, pt_years=pt_years)
@@ -620,4 +638,4 @@ if run:
     )
 
 else:
-    st.caption("Upload the POS PDF, enter PTD & Current FV, then click **Generate In-Force Tables**.")
+    st.caption("Upload the POS PDF, enter PTD & Current FV, then click **Generate In-Force Projection**.")
