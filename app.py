@@ -1,11 +1,7 @@
 # app.py — Streamlit Cloud–ready In-Force Illustration (PDF-powered)
 # Upload POS PDF -> auto-read Issue Date, PT/PPT, Mode, Premium, SA, Allocations, LA Name
 # Enter only PTD + Current FV. Projections: 8% continue; 5% DF in lock-in if discontinued.
-# LATEST CHANGES:
-#  - Snapshot shows LA name
-#  - Snapshot shows projected totals of GA+BA, Loyalty, and Total (from today to PT end)
-#  - Yearly Projection table removed; replaced with FV (EOY) line graph only
-#  - No "charges % of FV" anywhere
+# Retention Pitch added right after Snapshot with crisp, number-led hooks.
 
 import io, re, math, json
 import numpy as np
@@ -26,6 +22,7 @@ COI_GST     = 0.18
 COI_SCALER  = 1.0
 DF_ANNUAL   = 0.05   # discontinuance fund growth (lock-in)
 CONT_ANNUAL = 0.08   # continue growth
+ULIP_TAX_CHANGE_DATE = dt.date(2021, 2, 1)  # Budget 2021 threshold logic starts
 
 @st.cache_data
 def load_rate_tables():
@@ -88,6 +85,12 @@ def add_years(d: dt.date, years: int) -> dt.date:
     except ValueError:
         return d.replace(month=2, day=28, year=d.year + years)
 
+def add_months(d: dt.date, months: int) -> dt.date:
+    y = d.year + (d.month - 1 + months) // 12
+    m = (d.month - 1 + months) % 12 + 1
+    day = min(d.day, [31,29 if y%4==0 and (y%100!=0 or y%400==0) else 28,31,30,31,30,31,31,30,31,30,31][m-1])
+    return dt.date(y, m, day)
+
 def months_between(d0: dt.date, d1: dt.date) -> int:
     sign = 1 if d1 >= d0 else -1
     a, b = (d0, d1) if sign == 1 else (d1, d0)
@@ -118,10 +121,30 @@ def determine_policy_status(issue_date: dt.date, ptd_date: dt.date, valuation_da
         return "DISCONTINUED", lk_end, ppt_end, True
     return "RPU", lk_end, ppt_end, False
 
+# Estimate total premium paid till PTD (assumes premiums were paid as scheduled until PTD)
+def premiums_paid_till_ptd(issue_date: dt.date, ptd_date: dt.date, ppt_years: int, annual_premium: float, mode: str) -> float:
+    if ptd_date is None: return 0.0
+    # scheduling by policy month index
+    if mode == "Annual":      scheduled = [1]
+    elif mode == "Semi-Annual": scheduled = [1,7]
+    elif mode == "Quarterly":   scheduled = [1,4,7,10]
+    else:                       scheduled = list(range(1,13))
+
+    N = len(scheduled)
+    installment = annual_premium / N if N else annual_premium
+
+    count = 0
+    for y in range(1, ppt_years+1):
+        for s in scheduled:
+            m_index = (y-1)*12 + s  # policy-month index (1-based)
+            due_date = add_months(issue_date, m_index-1)
+            if due_date <= min(ptd_date, dt.date.today()):
+                count += 1
+    return count * installment
+
 # ===================
 # POS PDF parser (grid + funds table)
 # ===================
-CURRENCY = r"₹?\s?([\d,]+(?:\.\d{1,2})?)"
 PCT = r"(\d{1,3}(?:\.\d+)?)[ ]*%"
 
 def _to_number(s: str):
@@ -131,42 +154,30 @@ def _to_number(s: str):
     except: return None
 
 def _parse_human_date(s: str) -> dt.date:
-    """Accepts dd-mm-yy, dd/mm/yy, dd-mmm-yy, dd mmm yyyy, etc.
-       If only month-year is present (rare), defaults day=1.
-       2-digit years -> 2000 + yy."""
-    if not s:
-        return None
+    """Accepts dd-mm-yy, dd/mm/yy, dd-mmm-yy, dd mmm yyyy, etc."""
+    if not s: return None
     s = s.strip()
-    # Try robust parser first
     try:
         d = dparser.parse(s, dayfirst=True, fuzzy=True).date()
         if d.year < 100: d = dt.date(2000 + d.year, d.month, d.day)
         return d
     except Exception:
         pass
-    # dd-mm-yy / dd/mm/yy
+    # Fallbacks
     m = re.match(r"^(\d{1,2})[-/](\d{1,2})[-/](\d{2})$", s)
     if m:
-        dd, mm, yy = map(int, m.groups())
-        return dt.date(2000+yy, mm, dd)
-    # dd-mmm-yy / dd mmm yy
+        dd, mm, yy = map(int, m.groups()); return dt.date(2000+yy, mm, dd)
     m = re.match(r"^(\d{1,2})[ -/]([A-Za-z]{3,9})[ -/](\d{2})$", s)
     if m:
-        dd = int(m.group(1))
-        mm = dt.datetime.strptime(m.group(2)[:3], "%b").month
-        yy = int(m.group(3))
+        dd = int(m.group(1)); mm = dt.datetime.strptime(m.group(2)[:3], "%b").month; yy = int(m.group(3))
         return dt.date(2000+yy, mm, dd)
-    # month-year only (fallback) -> 1st of month
     m = re.match(r"^(\d{1,2})[-/](\d{2,4})$", s)
     if m:
-        mm, yy = int(m.group(1)), int(m.group(2))
-        if yy < 100: yy += 2000
+        mm, yy = int(m.group(1)), int(m.group(2)); yy = 2000+yy if yy < 100 else yy
         return dt.date(yy, mm, 1)
     m = re.match(r"^([A-Za-z]{3,9})[-/](\d{2,4})$", s)
     if m:
-        mm = dt.datetime.strptime(m.group(1)[:3], "%b").month
-        yy = int(m.group(2))
-        if yy < 100: yy += 2000
+        mm = dt.datetime.strptime(m.group(1)[:3], "%b").month; yy = int(m.group(2)); yy = 2000+yy if yy < 100 else yy
         return dt.date(yy, mm, 1)
     return None
 
@@ -185,7 +196,7 @@ def parse_pos_pdf(file_bytes: bytes):
         kv = {}
         allocations = []
 
-        for pidx, page in enumerate(pdf.pages):
+        for page in pdf.pages:
             txt = page.extract_text() or ""
             all_text.append(txt)
 
@@ -211,12 +222,11 @@ def parse_pos_pdf(file_bytes: bytes):
                 # KV capture (label : value)
                 for r in rows:
                     if len(r) >= 2 and r[0] and r[1]:
-                        lab = _norm(r[0])
-                        val = r[1].strip()
+                        lab = _norm(r[0]); val = r[1].strip()
                         if len(lab) > 3 and val:
                             kv[lab] = val
 
-                # Allocation table detection (has 'Fund' & 'Allocation' in header row)
+                # Allocation table detection
                 hdr_idx = None
                 for i, r in enumerate(rows):
                     joined = " | ".join(r).lower()
@@ -411,7 +421,6 @@ def run_projection_inforce(
 # Output builders (graph data)
 # ===================
 def yearly_fv_series(df_monthly, pt_years):
-    """Return a tidy DF with Policy Year and FV_EOY for graphing from current year to PT end."""
     eoy = (
         df_monthly[df_monthly["Month"] == 12]
         .loc[:, ["Year","CK_raw"]]
@@ -420,9 +429,8 @@ def yearly_fv_series(df_monthly, pt_years):
         .sort_values("Year")
     )
     idx = pd.Index(range(1, pt_years+1), name="Year")
-    eoy = eoy.set_index("Year").reindex(idx)
-    eoy = eoy.reset_index()
-    return eoy  # columns: Year, FV_EOY (float or NaN)
+    eoy = eoy.set_index("Year").reindex(idx).reset_index()
+    return eoy
 
 def fv_at_year_eoy(df_monthly, year_n: int):
     row = df_monthly[(df_monthly["Month"]==12) & (df_monthly["Year"]==year_n)]
@@ -562,6 +570,8 @@ if run:
         st.stop()
 
     valuation_date = dt.date.today()
+
+    # Projections
     df_m, status, lk_end, ppt_end = run_projection_inforce(
         issue_date, valuation_date, ptd_date,
         la_dob, la_gender,
@@ -571,80 +581,143 @@ if run:
         fv0_seed=fv0_seed
     )
 
-    # --- NEW: totals of additions from today -> end of PT (based on the current projection df_m)
-    total_GA_BA = float(df_m["CI_raw"].sum())          # GA + BA packed in CI_raw
-    total_Loyalty = float(df_m["CJ_raw"].sum())        # Loyalty in CJ_raw
+    # Totals of additions from today -> PT end
+    total_GA_BA = float(df_m["CI_raw"].sum())
+    total_Loyalty = float(df_m["CJ_raw"].sum())
     total_additions = total_GA_BA + total_Loyalty
 
-    st.subheader("Snapshot")
-    c1, c2, c3, c4 = st.columns(4)   # changed from 3 to 4
+    # FV KPIs
+    py_today = policy_year_today(issue_date, valuation_date, pt_years)
+    py_in_2 = policy_year_today(issue_date, add_years(valuation_date, 2), pt_years)
+    py_in_5 = policy_year_today(issue_date, add_years(valuation_date, 5), pt_years)
+    fv_2y = fv_at_year_eoy(df_m, py_in_2)
+    fv_5y = fv_at_year_eoy(df_m, py_in_5)
 
+    # Premiums paid till PTD (for “you’ve invested so far” line)
+    invested_so_far = premiums_paid_till_ptd(issue_date, ptd_date, ppt_years, annual_premium, mode)
+
+    # Partial withdrawal (this year)
+    pw_tbl = partial_withdrawal_availability(df_m, pt_years=pt_years)
+    pw_now = pw_tbl.loc[pw_tbl["Policy_Year"] == py_today].iloc[0] if (py_today in pw_tbl["Policy_Year"].values) else None
+    pw_now_amt = int(pw_now["Max_Available"]) if pw_now is not None and pw_now["Eligible"] == "Yes" else 0
+    pw_eligible_now = (pw_now is not None and pw_now["Eligible"] == "Yes")
+
+    # DF compare if discontinued within lock-in
+    df_y5 = None
+    if status == "DISCONTINUED":
+        df_y5 = discontinuance_y5_value_from_today(fv0_seed, issue_date, valuation_date)
+
+    # Snapshot
+    st.subheader("Snapshot")
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.write(f"**Life Assured:** {la_name}")
         st.write(f"**Issue Date:** {issue_date.strftime('%d-%b-%Y')}")
         st.write(f"**Valuation Date:** {valuation_date.strftime('%d-%b-%Y')}")
         st.write(f"**Lock-in End:** {lk_end.strftime('%d-%b-%Y')}")
-
     with c2:
         st.write(f"**Status (computed):** {status}")
         st.write(f"**PPT End:** {ppt_end.strftime('%d-%b-%Y')}")
         st.write(f"**Mode:** {mode}")
-
     with c3:
         st.write(f"**Fund Value Today:** ₹{format_in_indian_system(fv0_seed)}")
         st.write(f"**Annual Premium:** ₹{format_in_indian_system(annual_premium)}")
         st.write(f"**PT / PPT:** {pt_years} / {ppt_years}")
-
     with c4:
         st.write("**Projected Additions (from today → PT end)**")
         st.write(f"- GA + BA: ₹{format_in_indian_system(total_GA_BA)}")
         st.write(f"- Loyalty: ₹{format_in_indian_system(total_Loyalty)}")
         st.write(f"**Total:** ₹{format_in_indian_system(total_additions)}")
 
-    st.subheader("Projection KPIs (EOY, Continue @8%; DF @5% if discontinued in lock-in)")
-    py_in_2 = policy_year_today(issue_date, add_years(valuation_date, 2), pt_years)
-    py_in_5 = policy_year_today(issue_date, add_years(valuation_date, 5), pt_years)
-    fv_2y = fv_at_year_eoy(df_m, py_in_2)
-    fv_5y = fv_at_year_eoy(df_m, py_in_5)
+    # ---------------- Retention Pitch (for caller) ----------------
+    st.subheader("Retention Pitch (for caller)")
+    pitch_lines = []
 
-    k1, k2, k3 = st.columns(3)
-    with k1:
-        st.metric("Fund Value in 2 Years (EOY)", f"₹{format_in_indian_system(fv_2y) if fv_2y else '—'}")
-    with k2:
-        st.metric("Fund Value in 5 Years (EOY)", f"₹{format_in_indian_system(fv_5y) if fv_5y else '—'}")
+    # 1) Snapshot opener with invested vs FV
+    pitch_lines.append(
+        f"• You’ve invested about **₹{format_in_indian_system(invested_so_far)}** so far. "
+        f"Your current **Fund Value is ₹{format_in_indian_system(fv0_seed)}**."
+    )
 
-    if status == "DISCONTINUED":
-        df_y5 = discontinuance_y5_value_from_today(fv0_seed, issue_date, valuation_date)
-        with k3:
-            st.metric("DF Payout at end of 5th Year (@5%)", f"₹{format_in_indian_system(df_y5)}")
-        if fv_5y is not None:
-            delta = fv_5y - df_y5
-            st.info(
-                f"**Comparison:** Continue (@8%, with premiums) in 5 years = ₹{format_in_indian_system(fv_5y)} "
-                f"vs DF payout at end of 5th year = ₹{format_in_indian_system(df_y5)} "
-                f"→ **Δ = ₹{format_in_indian_system(delta)}**"
-            )
+    # 2) Growth hooks (loss aversion & future-self)
+    if fv_2y is not None:
+        delta_2 = max(0, fv_2y - fv0_seed)
+        per_month = delta_2 / 24.0 if delta_2 > 0 else 0
+        pitch_lines.append(
+            f"• At the standard 8% illustration, your fund is projected to be **₹{format_in_indian_system(fv_2y)} in 2 years** "
+            f"(~**₹{format_in_indian_system(per_month)}** growth **per month** from here)."
+        )
+    if fv_5y is not None:
+        delta_5 = max(0, fv_5y - fv0_seed)
+        pitch_lines.append(
+            f"• In **5 years**, staying invested could take you to **₹{format_in_indian_system(fv_5y)}** "
+            f"(that’s **₹{format_in_indian_system(delta_5)}** more than today)."
+        )
+
+    # 3) Tax nudge (Pre-2021 assumption)
+    if issue_date < ULIP_TAX_CHANGE_DATE:
+        pitch_lines.append(
+            "• Since your policy was **issued before Feb 2021**, the maturity is **generally tax-free** "
+            "(u/s 10(10D), assuming premiums within limits) — it’s hard to replicate this outside."
+        )
+    else:
+        pitch_lines.append(
+            "• Newer ULIPs (issued on/after Feb 2021) can have different tax rules. **Your policy’s tax treatment may differ**; "
+            "staying invested preserves your existing structure."
+        )
+
+    # 4) Low charges going forward (if past Y5)
+    if py_today >= 6:
+        pitch_lines.append("• You’ve **already crossed the high-charge phase** (Years 1–5). Admin charges ahead are **nil** under this plan.")
+
+    # 5) Company additions ahead
+    pitch_lines.append(
+        f"• The plan adds **loyalty & booster additions** over time. From today to maturity, you’re on track for "
+        f"**₹{format_in_indian_system(total_GA_BA)} (GA+BA)** and **₹{format_in_indian_system(total_Loyalty)} (Loyalty)** "
+        f"— a combined **₹{format_in_indian_system(total_additions)}** added to your fund."
+    )
+
+    # 6) Partial withdrawals vs surrender (immediate need)
+    if pw_eligible_now and pw_now_amt > 0:
+        pitch_lines.append(
+            f"• Need money now? You can take a **partial withdrawal up to ₹{format_in_indian_system(pw_now_amt)}** **without surrendering**. "
+            "This keeps your policy and future additions intact."
+        )
+    else:
+        pitch_lines.append(
+            "• Need money now? From the **6th policy year onwards**, you can use **partial withdrawals** instead of surrendering "
+            "(while ensuring fund value ≥ 105% of total premiums paid)."
+        )
+
+    # 7) Discontinuance compare (if relevant)
+    if df_y5 is not None and fv_5y is not None:
+        delta_df = fv_5y - df_y5
+        pitch_lines.append(
+            f"• If you stay discontinued, the **Discontinuance Fund** pays about **₹{format_in_indian_system(df_y5)}** at the end of year 5 "
+            f"(min 5% p.a.). Continuing at 8% projects **₹{format_in_indian_system(fv_5y)}** — that’s **₹{format_in_indian_system(delta_df)} more**."
+        )
+
+    # 8) Re-entry cost nudge
+    pitch_lines.append(
+        "• Buying new insurance later usually costs **more** (higher age, medicals, waiting periods). "
+        "Keeping this policy avoids re-entry costs and preserves your accumulated benefits."
+    )
+
+    st.markdown("\n".join(pitch_lines))
+
+    st.caption("Notes: Projections follow standard 8%/5% illustrations. Actual returns depend on market performance. Tax treatment depends on prevailing laws and your specifics; please consult your tax advisor.")
 
     # ------- FV Graph (EOY) till PT end -------
     st.subheader("Fund Value at End of Each Policy Year")
     eoy_series = yearly_fv_series(df_m, pt_years=pt_years)
-
-    # Prepare display-friendly series (NaN -> None)
     graph_df = eoy_series.copy()
-    graph_df["FV_EOY_Display"] = graph_df["FV_EOY"].apply(
-        lambda x: None if pd.isna(x) else float(x)
-    )
-
-    st.line_chart(
-        data=graph_df.set_index("Year")["FV_EOY_Display"],
-        use_container_width=True
-    )
+    graph_df["FV_EOY_Display"] = graph_df["FV_EOY"].apply(lambda x: None if pd.isna(x) else float(x))
+    st.line_chart(data=graph_df.set_index("Year")["FV_EOY_Display"], use_container_width=True)
     st.caption("Graph shows projected Fund Value at the end of each policy year from current year until PT end.")
 
-    # ------- Partial Withdrawals -------
+    # ------- Partial Withdrawals (full table for reference) -------
     st.subheader("Partial Withdrawal — Eligibility & Maximum Available (EOY)")
     st.caption("Rules: from 6th policy year; min ₹500; FV after withdrawal ≥ 105% of total premiums paid.")
-    pw_tbl = partial_withdrawal_availability(df_m, pt_years=pt_years)
     pw_fmt = pw_tbl.copy()
     pw_fmt["Max_Available"] = pw_fmt["Max_Available"].apply(lambda x: f"₹{format_in_indian_system(x)}" if x else "₹0")
     st.dataframe(
