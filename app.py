@@ -1,7 +1,11 @@
 # app.py — Streamlit Cloud–ready In-Force Illustration (PDF-powered)
 # Upload POS PDF -> auto-read Issue Date, PT/PPT, Mode, Premium, SA, Allocations, LA Name
 # Enter only PTD + Current FV. Projections: 8% continue; 5% DF in lock-in if discontinued.
-# Retention Pitch added right after Snapshot with crisp, number-led hooks.
+# Retention Pitch: bullet points + dynamic highlights of strongest hooks.
+# UPDATED: Issue Date parsing — prioritize KV fields; fallback to signature line; then safe scan:
+#          • skip parentheses (e.g., fund codes "(ULIF00118/08/11...)")
+#          • skip lines with "ULIF"
+#          • accept only years >= 2015
 
 import io, re, math, json
 import numpy as np
@@ -20,9 +24,9 @@ DATA_DIR    = Path(__file__).parent / "data"
 SERVICE_TAX = 0.18
 COI_GST     = 0.18
 COI_SCALER  = 1.0
-DF_ANNUAL   = 0.05   # discontinuance fund growth (lock-in)
-CONT_ANNUAL = 0.08   # continue growth
-ULIP_TAX_CHANGE_DATE = dt.date(2021, 2, 1)  # Budget 2021 threshold logic starts
+DF_ANNUAL   = 0.05   # Discontinuance fund growth (lock-in)
+CONT_ANNUAL = 0.08   # Continue growth
+ULIP_TAX_CHANGE_DATE = dt.date(2021, 2, 1)  # Budget 2021 ULIP change reference date
 
 @st.cache_data
 def load_rate_tables():
@@ -124,12 +128,10 @@ def determine_policy_status(issue_date: dt.date, ptd_date: dt.date, valuation_da
 # Estimate total premium paid till PTD (assumes premiums were paid as scheduled until PTD)
 def premiums_paid_till_ptd(issue_date: dt.date, ptd_date: dt.date, ppt_years: int, annual_premium: float, mode: str) -> float:
     if ptd_date is None: return 0.0
-    # scheduling by policy month index
     if mode == "Annual":      scheduled = [1]
     elif mode == "Semi-Annual": scheduled = [1,7]
     elif mode == "Quarterly":   scheduled = [1,4,7,10]
     else:                       scheduled = list(range(1,13))
-
     N = len(scheduled)
     installment = annual_premium / N if N else annual_premium
 
@@ -143,7 +145,7 @@ def premiums_paid_till_ptd(issue_date: dt.date, ptd_date: dt.date, ppt_years: in
     return count * installment
 
 # ===================
-# POS PDF parser (grid + funds table)
+# POS PDF parser
 # ===================
 PCT = r"(\d{1,3}(?:\.\d+)?)[ ]*%"
 
@@ -154,7 +156,6 @@ def _to_number(s: str):
     except: return None
 
 def _parse_human_date(s: str) -> dt.date:
-    """Accepts dd-mm-yy, dd/mm/yy, dd-mmm-yy, dd mmm yyyy, etc."""
     if not s: return None
     s = s.strip()
     try:
@@ -166,23 +167,39 @@ def _parse_human_date(s: str) -> dt.date:
     # Fallbacks
     m = re.match(r"^(\d{1,2})[-/](\d{1,2})[-/](\d{2})$", s)
     if m:
-        dd, mm, yy = map(int, m.groups()); return dt.date(2000+yy, mm, dd)
+        dd, mm, yy = map(int, m.groups())
+        return dt.date(2000+yy, mm, dd)
     m = re.match(r"^(\d{1,2})[ -/]([A-Za-z]{3,9})[ -/](\d{2})$", s)
     if m:
-        dd = int(m.group(1)); mm = dt.datetime.strptime(m.group(2)[:3], "%b").month; yy = int(m.group(3))
+        dd = int(m.group(1))
+        mm = dt.datetime.strptime(m.group(2)[:3], "%b").month
+        yy = int(m.group(3))
         return dt.date(2000+yy, mm, dd)
     m = re.match(r"^(\d{1,2})[-/](\d{2,4})$", s)
     if m:
-        mm, yy = int(m.group(1)), int(m.group(2)); yy = 2000+yy if yy < 100 else yy
+        mm, yy = int(m.group(1)), int(m.group(2))
+        if yy < 100: yy += 2000
         return dt.date(yy, mm, 1)
     m = re.match(r"^([A-Za-z]{3,9})[-/](\d{2,4})$", s)
     if m:
-        mm = dt.datetime.strptime(m.group(1)[:3], "%b").month; yy = int(m.group(2)); yy = 2000+yy if yy < 100 else yy
+        mm = dt.datetime.strptime(m.group(1)[:3], "%b").month
+        yy = int(m.group(2))
+        if yy < 100: yy += 2000
         return dt.date(yy, mm, 1)
     return None
 
 def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+"," ", s.lower()).strip()
+
+# --- NEW: year filter (>= 2015) ---
+def _valid_year(y: int) -> bool:
+    return y >= 2015
+
+def _parse_human_date_safe(s: str):
+    d = _parse_human_date(s)
+    if d and _valid_year(d.year):
+        return d
+    return None
 
 def parse_pos_pdf(file_bytes: bytes):
     out = {
@@ -200,14 +217,7 @@ def parse_pos_pdf(file_bytes: bytes):
             txt = page.extract_text() or ""
             all_text.append(txt)
 
-            # Try header date (top line)
-            if not out["issue_date"]:
-                header_line = txt.splitlines()[0] if txt else ""
-                hit = re.search(r"(\d{1,2}[-/][A-Za-z]{3,9}[-/]\d{2,4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})", header_line)
-                if hit:
-                    out["issue_date"] = hit.group(1)
-
-            # Tables: KV from left grid + allocations table on right
+            # Tables: KV & Allocations
             try:
                 tables = page.extract_tables() or []
             except Exception:
@@ -219,14 +229,14 @@ def parse_pos_pdf(file_bytes: bytes):
                     if not r: continue
                     rows.append([(c or "").strip() for c in r])
 
-                # KV capture (label : value)
+                # Key-Value grid
                 for r in rows:
                     if len(r) >= 2 and r[0] and r[1]:
                         lab = _norm(r[0]); val = r[1].strip()
                         if len(lab) > 3 and val:
                             kv[lab] = val
 
-                # Allocation table detection
+                # Allocation table
                 hdr_idx = None
                 for i, r in enumerate(rows):
                     joined = " | ".join(r).lower()
@@ -253,8 +263,7 @@ def parse_pos_pdf(file_bytes: bytes):
         return None
 
     # LA name
-    la_name_val = get_kv("Name of the Life Assured", "Name of Life Assured", "Life Assured", "LA Name")
-    out["la_name"] = la_name_val
+    out["la_name"] = get_kv("Name of the Life Assured", "Name of Life Assured", "Life Assured", "LA Name")
 
     # PT / PPT
     pt_val  = get_kv("Policy Term (in Years)", "Policy Term in Years", "Policy Term")
@@ -280,10 +289,40 @@ def parse_pos_pdf(file_bytes: bytes):
     sa_val = get_kv("Sum Assured (in Rupees)", "Sum Assured in Rupees", "Sum Assured")
     out["sum_assured"] = _to_number(sa_val)
 
-    # Issue date fallback
+    # --- NEW: Issue/Commencement Date extraction (safe & prioritized) ---
+    issue_val = get_kv("Date of Commencement", "Policy Commencement Date", "Issue Date", "Policy Start Date")
+    if issue_val:
+        d = _parse_human_date_safe(issue_val)
+        if d:
+            out["issue_date"] = d.strftime("%d-%b-%Y")
+
+    # Fallback 1: signature line (Place ... Date ...)
     if not out["issue_date"]:
-        m = re.search(r"(\d{1,2}[-/][A-Za-z]{3,9}[-/]\d{2,4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})", out["raw_text"])
-        if m: out["issue_date"] = m.group(1)
+        m = re.search(
+            r"(?:Place[^\\n]*?Date\s*[:\-]?\s*)(\d{1,2}[ -/][A-Za-z]{3,9}[ -/]\d{2,4}|\d{1,2}[ -/]\d{1,2}[ -/]\d{2,4})",
+            out["raw_text"], re.IGNORECASE
+        )
+        if m:
+            d = _parse_human_date_safe(m.group(1))
+            if d:
+                out["issue_date"] = d.strftime("%d-%b-%Y")
+
+    # Fallback 2: scan text lines, but skip parentheses & ULIF and enforce year >= 2015
+    if not out["issue_date"]:
+        for line in out["raw_text"].splitlines():
+            if "ULIF" in line.upper():
+                continue
+            # Remove bracketed substrings entirely
+            line_no_paren = re.sub(r"\([^)]*\)", "", line)
+            m = re.search(
+                r"(\d{1,2}[ -/][A-Za-z]{3,9}[ -/]\d{2,4}|\d{1,2}[ -/]\d{1,2}[ -/]\d{2,4})",
+                line_no_paren
+            )
+            if m:
+                d = _parse_human_date_safe(m.group(1))
+                if d:
+                    out["issue_date"] = d.strftime("%d-%b-%Y")
+                    break
 
     out["allocations"] = allocations
     if not out["allocations"]:
@@ -418,7 +457,7 @@ def run_projection_inforce(
     return pd.DataFrame(results), status, lockin_end_date(issue_date), ppt_end_date(issue_date, ppt_years)
 
 # ===================
-# Output builders (graph data)
+# Output builders
 # ===================
 def yearly_fv_series(df_monthly, pt_years):
     eoy = (
@@ -500,7 +539,16 @@ with st.expander("Show parsed fields (debug)"):
 colA, colB, colC = st.columns(3)
 
 _issue_date_raw = parsed.get("issue_date")
-issue_date = _parse_human_date(_issue_date_raw) if _issue_date_raw else dt.date(2018,1,1)
+# parsed["issue_date"] is already a normalized string if found via safe paths; else we will parse it:
+issue_date = None
+if _issue_date_raw:
+    try:
+        issue_date = _parse_human_date(_issue_date_raw)
+    except:
+        issue_date = None
+if not issue_date:
+    issue_date = dt.date(2018,1,1)  # conservative default if nothing found
+
 pt_years  = int(parsed.get("pt_years") or 26)
 ppt_years = int(parsed.get("ppt_years") or 15)
 mode      = (parsed.get("mode") or "Annual")
@@ -571,7 +619,6 @@ if run:
 
     valuation_date = dt.date.today()
 
-    # Projections
     df_m, status, lk_end, ppt_end = run_projection_inforce(
         issue_date, valuation_date, ptd_date,
         la_dob, la_gender,
@@ -586,28 +633,25 @@ if run:
     total_Loyalty = float(df_m["CJ_raw"].sum())
     total_additions = total_GA_BA + total_Loyalty
 
-    # FV KPIs
+    # KPIs & helpers
     py_today = policy_year_today(issue_date, valuation_date, pt_years)
     py_in_2 = policy_year_today(issue_date, add_years(valuation_date, 2), pt_years)
     py_in_5 = policy_year_today(issue_date, add_years(valuation_date, 5), pt_years)
     fv_2y = fv_at_year_eoy(df_m, py_in_2)
     fv_5y = fv_at_year_eoy(df_m, py_in_5)
 
-    # Premiums paid till PTD (for “you’ve invested so far” line)
     invested_so_far = premiums_paid_till_ptd(issue_date, ptd_date, ppt_years, annual_premium, mode)
 
-    # Partial withdrawal (this year)
+    # Partial withdrawal now (this policy year)
     pw_tbl = partial_withdrawal_availability(df_m, pt_years=pt_years)
     pw_now = pw_tbl.loc[pw_tbl["Policy_Year"] == py_today].iloc[0] if (py_today in pw_tbl["Policy_Year"].values) else None
     pw_now_amt = int(pw_now["Max_Available"]) if pw_now is not None and pw_now["Eligible"] == "Yes" else 0
     pw_eligible_now = (pw_now is not None and pw_now["Eligible"] == "Yes")
 
-    # DF compare if discontinued within lock-in
-    df_y5 = None
-    if status == "DISCONTINUED":
-        df_y5 = discontinuance_y5_value_from_today(fv0_seed, issue_date, valuation_date)
+    # DF comparison if discontinued within lock-in
+    df_y5 = discontinuance_y5_value_from_today(fv0_seed, issue_date, valuation_date) if status == "DISCONTINUED" else None
 
-    # Snapshot
+    # ---------------- Snapshot ----------------
     st.subheader("Snapshot")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -629,83 +673,93 @@ if run:
         st.write(f"- Loyalty: ₹{format_in_indian_system(total_Loyalty)}")
         st.write(f"**Total:** ₹{format_in_indian_system(total_additions)}")
 
-    # ---------------- Retention Pitch (for caller) ----------------
+    # ---------------- Retention Pitch (bullets + dynamic highlights) ----------------
     st.subheader("Retention Pitch (for caller)")
+
+    # Build bullet lines
     pitch_lines = []
+    pitch_lines.append(f"- **You’ve invested** about **₹{format_in_indian_system(invested_so_far)}** so far.")
+    pitch_lines.append(f"- **Your current fund value** is **₹{format_in_indian_system(fv0_seed)}**.")
 
-    # 1) Snapshot opener with invested vs FV
-    pitch_lines.append(
-        f"• You’ve invested about **₹{format_in_indian_system(invested_so_far)}** so far. "
-        f"Your current **Fund Value is ₹{format_in_indian_system(fv0_seed)}**."
-    )
-
-    # 2) Growth hooks (loss aversion & future-self)
     if fv_2y is not None:
         delta_2 = max(0, fv_2y - fv0_seed)
-        per_month = delta_2 / 24.0 if delta_2 > 0 else 0
+        per_month = int(round(delta_2 / 24.0)) if delta_2 > 0 else 0
         pitch_lines.append(
-            f"• At the standard 8% illustration, your fund is projected to be **₹{format_in_indian_system(fv_2y)} in 2 years** "
-            f"(~**₹{format_in_indian_system(per_month)}** growth **per month** from here)."
+            f"- At **8% projection**, your fund could grow to:\n"
+            f"  - **₹{format_in_indian_system(fv_2y)} in 2 years** "
+            f"(_~₹{format_in_indian_system(per_month)} per month growth from here_)."
         )
     if fv_5y is not None:
         delta_5 = max(0, fv_5y - fv0_seed)
         pitch_lines.append(
-            f"• In **5 years**, staying invested could take you to **₹{format_in_indian_system(fv_5y)}** "
-            f"(that’s **₹{format_in_indian_system(delta_5)}** more than today)."
+            f"  - **₹{format_in_indian_system(fv_5y)} in 5 years** "
+            f"(**₹{format_in_indian_system(delta_5)} more than today**)."
         )
 
-    # 3) Tax nudge (Pre-2021 assumption)
-    if issue_date < ULIP_TAX_CHANGE_DATE:
+    pre2021 = issue_date < ULIP_TAX_CHANGE_DATE
+    if pre2021:
         pitch_lines.append(
-            "• Since your policy was **issued before Feb 2021**, the maturity is **generally tax-free** "
-            "(u/s 10(10D), assuming premiums within limits) — it’s hard to replicate this outside."
+            "- **Tax edge**: Issued **before Feb 2021**, maturity is **generally tax-free** (u/s 10(10D); "
+            "assumes premiums within limits). Hard to replicate this outside."
         )
     else:
         pitch_lines.append(
-            "• Newer ULIPs (issued on/after Feb 2021) can have different tax rules. **Your policy’s tax treatment may differ**; "
-            "staying invested preserves your existing structure."
+            "- **Tax note**: ULIPs issued on/after **Feb 2021** may face different rules; "
+            "staying invested preserves your current structure."
         )
 
-    # 4) Low charges going forward (if past Y5)
     if py_today >= 6:
-        pitch_lines.append("• You’ve **already crossed the high-charge phase** (Years 1–5). Admin charges ahead are **nil** under this plan.")
+        pitch_lines.append("- **Low charges ahead**: You’ve already crossed **high-charge years (1–5)**. Admin charges now are **nil**.")
 
-    # 5) Company additions ahead
     pitch_lines.append(
-        f"• The plan adds **loyalty & booster additions** over time. From today to maturity, you’re on track for "
-        f"**₹{format_in_indian_system(total_GA_BA)} (GA+BA)** and **₹{format_in_indian_system(total_Loyalty)} (Loyalty)** "
-        f"— a combined **₹{format_in_indian_system(total_additions)}** added to your fund."
+        f"- **Extra additions ahead**: From today till policy end, you’re on track for "
+        f"**₹{format_in_indian_system(total_GA_BA)} (GA+BA)** and **₹{format_in_indian_system(total_Loyalty)} (Loyalty)** — "
+        f"**₹{format_in_indian_system(total_additions)} in total** added to your fund."
     )
 
-    # 6) Partial withdrawals vs surrender (immediate need)
     if pw_eligible_now and pw_now_amt > 0:
         pitch_lines.append(
-            f"• Need money now? You can take a **partial withdrawal up to ₹{format_in_indian_system(pw_now_amt)}** **without surrendering**. "
-            "This keeps your policy and future additions intact."
+            f"- **Need funds now?** Use a **partial withdrawal up to ₹{format_in_indian_system(pw_now_amt)}** "
+            "instead of surrendering — keep your investment & future additions intact."
         )
     else:
         pitch_lines.append(
-            "• Need money now? From the **6th policy year onwards**, you can use **partial withdrawals** instead of surrendering "
-            "(while ensuring fund value ≥ 105% of total premiums paid)."
+            "- **Need funds now?** From the **6th policy year**, partial withdrawals can be used instead of surrendering "
+            "(subject to the 105% rule)."
         )
 
-    # 7) Discontinuance compare (if relevant)
-    if df_y5 is not None and fv_5y is not None:
+    if (df_y5 is not None) and (fv_5y is not None):
         delta_df = fv_5y - df_y5
         pitch_lines.append(
-            f"• If you stay discontinued, the **Discontinuance Fund** pays about **₹{format_in_indian_system(df_y5)}** at the end of year 5 "
-            f"(min 5% p.a.). Continuing at 8% projects **₹{format_in_indian_system(fv_5y)}** — that’s **₹{format_in_indian_system(delta_df)} more**."
+            f"- **If discontinued in lock-in**: Discontinuance Fund pays about **₹{format_in_indian_system(df_y5)}** at end of Year 5 "
+            f"(@5%). Continuing at 8% projects **₹{format_in_indian_system(fv_5y)}** — "
+            f"**₹{format_in_indian_system(delta_df)} more**."
         )
 
-    # 8) Re-entry cost nudge
     pitch_lines.append(
-        "• Buying new insurance later usually costs **more** (higher age, medicals, waiting periods). "
-        "Keeping this policy avoids re-entry costs and preserves your accumulated benefits."
+        "- **Re-entry cost**: Buying new insurance later usually costs **more** (higher age, medicals, waiting periods). "
+        "Keeping this policy preserves your benefits."
     )
 
-    st.markdown("\n".join(pitch_lines))
+    # Dynamic highlights (pick strongest 2–3)
+    highlights = []
+    if pre2021:
+        highlights.append("✅ **Tax-free maturity** (pre-2021 policy).")
+    if py_today >= 6:
+        highlights.append("✅ **Low/no admin charges ahead** (past Year 5).")
+    if fv_5y is not None and (fv_5y - fv0_seed) > 0:
+        highlights.append(f"✅ **₹{format_in_indian_system(fv_5y - fv0_seed)} more in 5 years** by staying invested.")
+    if (df_y5 is not None) and (fv_5y is not None) and ((fv_5y - df_y5) > 0):
+        highlights.append(f"✅ **Continue vs DF**: **₹{format_in_indian_system(fv_5y - df_y5)} more** than DF payout.")
 
-    st.caption("Notes: Projections follow standard 8%/5% illustrations. Actual returns depend on market performance. Tax treatment depends on prevailing laws and your specifics; please consult your tax advisor.")
+    highlights = highlights[:3]
+
+    if highlights:
+        st.success("**Key hooks for this customer:**\n\n" + "\n".join([f"- {h}" for h in highlights]))
+
+    # Full bullet list
+    st.markdown("\n".join(pitch_lines))
+    st.caption("Notes: Projections use standard 8%/5% illustrations. Actual returns depend on markets. Tax treatment depends on prevailing laws and your specifics — please consult your tax advisor.")
 
     # ------- FV Graph (EOY) till PT end -------
     st.subheader("Fund Value at End of Each Policy Year")
