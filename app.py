@@ -1,10 +1,10 @@
 # app.py — Streamlit Cloud–ready In-Force Illustration (PDF-powered)
 # Upload POS PDF -> auto-read Issue Date, PT/PPT, Mode, Premium, SA, Allocations, LA Name
 # Enter only PTD + Current FV. Projections: 8% continue; 5% DF in lock-in if discontinued.
-# Changes per request:
+# CURRENT CHANGES:
 #  - Snapshot shows LA name
-#  - Yearly Projection table replaced with a line graph of FV (EOY) till PT end
-#  - Removed "Charges as % of FV"
+#  - Yearly Projection table removed; replaced with FV (EOY) line graph only
+#  - No "charges % of FV" anywhere
 
 import io, re, math, json
 import numpy as np
@@ -133,7 +133,7 @@ def _parse_human_date(s: str) -> dt.date:
     """Accepts dd-mm-yy, dd/mm/yy, dd-mmm-yy, dd mmm yyyy, etc.
        If only month-year is present (rare), defaults day=1.
        2-digit years -> 2000 + yy."""
-    if not s: 
+    if not s:
         return None
     s = s.strip()
     # Try robust parser first
@@ -410,7 +410,7 @@ def run_projection_inforce(
 # Output builders (graph data)
 # ===================
 def yearly_fv_series(df_monthly, pt_years):
-    """Return a tidy DF with Policy Year and FV_EOY for graphing."""
+    """Return a tidy DF with Policy Year and FV_EOY for graphing from current year to PT end."""
     eoy = (
         df_monthly[df_monthly["Month"] == 12]
         .loc[:, ["Year","CK_raw"]]
@@ -418,7 +418,6 @@ def yearly_fv_series(df_monthly, pt_years):
         .drop_duplicates(subset=["Year"])
         .sort_values("Year")
     )
-    # ensure we have rows 1..pt_years (fill NA with np.nan)
     idx = pd.Index(range(1, pt_years+1), name="Year")
     eoy = eoy.set_index("Year").reindex(idx)
     eoy = eoy.reset_index()
@@ -614,11 +613,13 @@ if run:
     # ------- FV Graph (EOY) till PT end -------
     st.subheader("Fund Value at End of Each Policy Year")
     eoy_series = yearly_fv_series(df_m, pt_years=pt_years)
-    # Prepare display-friendly DF
+
+    # Prepare display-friendly series (NaN -> None)
     graph_df = eoy_series.copy()
     graph_df["FV_EOY_Display"] = graph_df["FV_EOY"].apply(
         lambda x: None if pd.isna(x) else float(x)
     )
+
     # Plot: Streamlit's native line_chart
     st.line_chart(
         data=graph_df.set_index("Year")["FV_EOY_Display"],
